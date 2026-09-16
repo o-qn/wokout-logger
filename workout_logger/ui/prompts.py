@@ -68,6 +68,13 @@ def select(message: str, choices, default=None):
     def _interrupt(event):
         event.app.exit(exception=KeyboardInterrupt())
 
+    # RadioList has its own Enter binding which only marks an item as checked.
+    # Install our accept/cancel bindings directly on the focused control as well
+    # so they take priority and Enter actually closes the menu with a result.
+    radio.control.key_bindings.add("enter", eager=True)(_accept)
+    radio.control.key_bindings.add("escape", eager=True)(_cancel)
+    radio.control.key_bindings.add("c-c", eager=True)(_interrupt)
+
     root = HSplit([
         Label(text=message, style="class:question"),
         radio,
