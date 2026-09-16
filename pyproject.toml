@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terminal-workout-logger"
+version = "0.1.0"
+description = "Keyboard-first Linux terminal workout logger with SQLite and Excel export"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "prompt_toolkit>=3.0.40",
+  "rich>=13.7.0",
+  "openpyxl>=3.1.2",
+]
+
+[project.scripts]
+workout = "workout_logger.main:run"
+
+[tool.setuptools.packages.find]
+include = ["workout_logger*"]
