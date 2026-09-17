@@ -151,6 +151,23 @@ python -m unittest discover -s tests -v
 
 The tests create temporary databases and workbooks; they do not touch your real workout data.
 
+
+## Creating a permanent workout command that uses the app’s virtual environment directly.
+```
+mkdir -p ~/.local/bin
+
+printf '%s\n' '#!/usr/bin/env bash' \
+'exec "/home/qn/Documents/workout logger/workout_logger_app/.venv/bin/python" -m workout_logger "$@"' \
+> ~/.local/bin/workout
+
+chmod +x ~/.local/bin/workout
+```
+And make sure ``` ~/.local/bin ``` is in you local path
+```fish
+fish_add_path ~/.local/bin
+```
+and now from any directory you can type workout and the logger should open directly
+
 ## Initial exercises
 
 1. Supinated Single-Arm Extension — external weight
