@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
 import math
+import sqlite3
 import sys
 import time
 from typing import Any, Callable, Iterator, Mapping, Protocol
@@ -129,10 +130,17 @@ class SessionTimer:
             if rest_seconds >= self._target:
                 result += "  •  Rest complete"
                 if self._sound and not self._alerted and not self._paused:
-                    self._alerted = True
                     marker = getattr(self.service, "mark_rest_reminder_delivered", None)
-                    if marker is None or marker(self.session_id, self._rest_value):
-                        self._notify()
+                    try:
+                        claimed = marker is None or marker(self.session_id, self._rest_value)
+                    except (OSError, sqlite3.Error):
+                        # A temporary busy/full database must not crash the
+                        # editable prompt. Retry the atomic claim on a redraw.
+                        pass
+                    else:
+                        self._alerted = True
+                        if claimed:
+                            self._notify()
             else:
                 result += f"  •  Rest target: {format_elapsed(self._target)}"
         return result

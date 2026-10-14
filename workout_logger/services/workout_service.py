@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional, Iterable
 
 from ..database import Database
 from ..models import WorkoutEntryData
+from ..measurements import measurement_unit
 from ..backups import BackupManager, BackupError
-from .management import ManagementMixin
-from .timing import TimingMixin
+from .management import ManagementMixin, _nonnegative, _validated_entry, _DEFAULT_FIELDS
+from .timing import TimingMixin, current_time
 from .comparison import ComparisonMixin
 
 
@@ -54,9 +56,10 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
     def set_setting(self, key: str, value):
         self.db.execute("INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
 
-    def _template_unchanged(self, conn, session):
-        row = conn.execute("SELECT revision FROM workout_templates WHERE id=?", (session["template_id"],)).fetchone()
-        return row is not None and row["revision"] == session["template_revision"]
+    def _template_unchanged(self, conn, session, *, include_config=True):
+        row = conn.execute("SELECT revision,config_revision FROM workout_templates WHERE id=? AND active=1", (session["template_id"],)).fetchone()
+        return (row is not None and row["revision"] == session["template_revision"]
+                and (not include_config or row["config_revision"] == session["template_config_revision"]))
 
     # ---------- exercises ----------
     def active_exercises(self):
@@ -73,7 +76,8 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
         row = self.db.fetchone("SELECT * FROM exercises WHERE id=?", (exercise_id,))
         return dict(row) if row else None
 
-    def add_exercise(self, name: str, measurement_type: str, default_unit: str = "kg", resistance_unit: str | None = None):
+    def add_exercise(self, name: str, measurement_type: str, default_unit: str | None = None, resistance_unit: str | None = None):
+        default_unit = measurement_unit(measurement_type, requested=default_unit)
         row = self.db.fetchone("SELECT COALESCE(MAX(display_order),0)+1 AS n FROM exercises")
         return self.db.execute(
             "INSERT INTO exercises(name, measurement_type, default_unit, resistance_unit, display_order) VALUES(?,?,?,?,?)",
@@ -83,6 +87,17 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
 
     def update_exercise(self, exercise_id: int, **changes):
         allowed = {"name", "measurement_type", "default_unit", "resistance_unit", "aliases", "display_order", "archived"}
+        exercise = self.get_exercise(exercise_id)
+        if not exercise:
+            raise ValueError("Exercise not found")
+        mode = changes.get("measurement_type", exercise["measurement_type"])
+        if "measurement_type" in changes or "default_unit" in changes:
+            changes["default_unit"] = measurement_unit(
+                mode, requested=changes.get("default_unit"), previous=exercise["default_unit"],
+            )
+        if "measurement_type" in changes and mode != exercise["measurement_type"]:
+            # Resistance labels do not carry over into a different mode.
+            changes.setdefault("resistance_unit", None)
         pairs = [(k, v) for k, v in changes.items() if k in allowed]
         if not pairs:
             return
@@ -120,11 +135,14 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
 
     def create_template(self) -> int:
         with self.db.connect() as conn:
-            self._relabel_templates_conn(conn)
-            count = conn.execute("SELECT COUNT(*) FROM workout_templates WHERE active=1").fetchone()[0]
-            return int(conn.execute(
-                "INSERT INTO workout_templates(label) VALUES(?)", (_label_from_index(count + 1),)
-            ).lastrowid)
+            return self._create_template_conn(conn)
+
+    def _create_template_conn(self, conn) -> int:
+        self._relabel_templates_conn(conn)
+        count = conn.execute("SELECT COUNT(*) FROM workout_templates WHERE active=1").fetchone()[0]
+        return int(conn.execute(
+            "INSERT INTO workout_templates(label) VALUES(?)", (_label_from_index(count + 1),)
+        ).lastrowid)
 
     def _relabel_templates_conn(self, conn):
         # The unique label belongs to the current menu; history owns a separate
@@ -169,6 +187,7 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
             WHERE {where}
             """, params,
         ).fetchall()
+        changed_templates = set()
         for row in rows:
             if (row["measurement_type_snapshot"], row["unit_snapshot"], row["resistance_unit_snapshot"]) == (
                 row["measurement_type"], row["default_unit"], row["resistance_unit"]
@@ -185,6 +204,9 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
                 """,
                 (row["measurement_type"], row["default_unit"], row["resistance_unit"], row["id"]),
             )
+            changed_templates.add(row["template_id"])
+        for changed_template_id in changed_templates:
+            conn.execute("UPDATE workout_templates SET config_revision=config_revision+1 WHERE id=?", (changed_template_id,))
 
     def template_exercises(self, template_id: int):
         with self.db.connect() as conn:
@@ -203,21 +225,29 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
 
     # ---------- sessions ----------
     def start_new_template_session(self, session_date: str, bodyweight: str) -> int:
-        template_id = self.create_template()
-        return self._start_session(template_id, session_date, bodyweight, created_new_template=True)
+        with self.db.connect() as conn:
+            template_id = self._create_template_conn(conn)
+            return self._start_session(template_id, session_date, bodyweight, created_new_template=True, conn=conn)
 
     def start_existing_template_session(self, template_id: int, session_date: str, bodyweight: str) -> int:
         return self._start_session(template_id, session_date, bodyweight, created_new_template=False)
 
-    def _start_session(self, template_id: int, session_date: str, bodyweight: str, created_new_template: bool):
-        now = datetime.now().astimezone().isoformat(timespec="seconds")
-        with self.db.connect() as conn:
+    def _start_session(self, template_id: int, session_date: str, bodyweight: str, created_new_template: bool, conn=None):
+        try:
+            session_date = date.fromisoformat(str(session_date)).isoformat()
+        except ValueError:
+            raise ValueError("Use a valid workout date in YYYY-MM-DD format") from None
+        bodyweight = str(_nonnegative(bodyweight, "Bodyweight"))
+        now = current_time(self._timing_now()).isoformat(timespec="microseconds")
+        with (nullcontext(conn) if conn is not None else self.db.connect()) as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            self._sync_template_config_conn(conn, template_id=template_id)
             template = conn.execute(
                 "SELECT * FROM workout_templates WHERE id=? AND active=1", (template_id,)
             ).fetchone()
             if not template:
                 raise ValueError("Workout template has been removed")
-            self._sync_template_config_conn(conn, template_id=template_id)
             if created_new_template:
                 exercise_rows = conn.execute(
                     "SELECT * FROM exercises WHERE archived=0 ORDER BY display_order, id"
@@ -242,8 +272,9 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
             ).lastrowid)
             reminder = self.get_rest_reminder_settings()
             conn.execute(
-                "UPDATE workout_sessions SET comparison_mode=?, rest_target_seconds=?, rest_alert_sound=?, template_revision=? WHERE id=?",
-                (self.get_setting("comparison_mode", "previous"), reminder["target_seconds"], int(reminder["sound"]), template["revision"], session_id),
+                "UPDATE workout_sessions SET comparison_mode=?, rest_target_seconds=?, rest_alert_sound=?, template_revision=?, template_config_revision=? WHERE id=?",
+                (self.get_setting("comparison_mode", "previous"), reminder["target_seconds"], int(reminder["sound"]),
+                 template["revision"], template["config_revision"], session_id),
             )
             for index, source in enumerate(exercise_rows, start=1):
                 row = dict(source)
@@ -386,6 +417,7 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
         return int(row["exercise_order"]) if row else None
 
     def save_entry(self, session_id: int, data: WorkoutEntryData) -> int:
+        data = _validated_entry(data)
         session = self.get_session(session_id)
         if not session or session["status"] != "in_progress":
             raise ValueError("Session is not active")
@@ -429,6 +461,10 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
             now if not data.skipped else None,
         )
         with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = self._active_timing_session(conn, session_id)
+            if current["paused_at"]:
+                raise ValueError("Resume the workout before logging a set")
             cur = conn.execute(
                 """
                 INSERT INTO workout_entries(
@@ -441,7 +477,14 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
                 values,
             )
             entry_id = int(cur.lastrowid)
-            if session["created_new_template"] and self._template_unchanged(conn, session):
+            if session["created_new_template"] and self._template_unchanged(conn, session, include_config=False):
+                defaults = (
+                    str(data.external_load) if data.external_load is not None else None,
+                    str(data.assistance) if data.assistance is not None else None,
+                    str(data.duration_seconds) if data.duration_seconds is not None else None,
+                    data.rounds, str(data.rest_seconds) if data.rest_seconds is not None else None,
+                    str(data.resistance_value) if data.resistance_value is not None else None,
+                ) if self._template_unchanged(conn, session) else (None,) * 6
                 conn.execute(
                     """
                     INSERT INTO workout_template_exercises(
@@ -452,11 +495,7 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
                     """,
                     (
                         session["template_id"], data.exercise_id, order, data.measurement_type, data.unit,
-                        data.resistance_unit, str(data.external_load) if data.external_load is not None else None,
-                        str(data.assistance) if data.assistance is not None else None,
-                        str(data.duration_seconds) if data.duration_seconds is not None else None,
-                        data.rounds, str(data.rest_seconds) if data.rest_seconds is not None else None,
-                        str(data.resistance_value) if data.resistance_value is not None else None,
+                        data.resistance_unit, *defaults,
                     ),
                 )
                 self._sync_template_config_conn(conn, template_id=session["template_id"])
@@ -500,6 +539,8 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
         old = self.get_entry(entry_id)
         if not old:
             raise ValueError("Entry not found")
+        if data.exercise_id != old["exercise_id"]:
+            raise ValueError("Editing an entry must preserve its original exercise")
         if (data.measurement_type, data.unit, data.resistance_unit) != (
             old["measurement_type"], old["unit"],
             _resistance_unit(old["measurement_type"], old["unit"], old["resistance_unit"])
@@ -510,16 +551,23 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
             return self.correct_entry(entry_id, data)
         if session["status"] != "in_progress" or session["paused_at"]:
             raise ValueError("Only an active, unpaused workout can be edited here")
+        data = _validated_entry(data)
         now = self._timing_now().isoformat(timespec="microseconds")
         newly_logged = old["skipped"] and not data.skipped
         with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = self._active_timing_session(conn, old["session_id"])
+            if current["paused_at"]:
+                raise ValueError("Only an active, unpaused workout can be edited here")
             conn.execute(
                 """
                 UPDATE workout_entries SET
                     exercise_name_snapshot=?, measurement_type=?, unit=?, bodyweight=?, external_load=?,
                     assistance=?, reps=?, duration_seconds=?, rounds=?, rest_seconds=?, resistance_value=?,
                     resistance_unit=?, custom_result=?, rir_code=?, failure=?, notes=?, skipped=?,
-                    logged_at=CASE WHEN ? THEN ? ELSE logged_at END, updated_at=CURRENT_TIMESTAMP
+                    logged_at=CASE WHEN ? THEN NULL WHEN ? THEN ? ELSE logged_at END,
+                    rest_alerted=CASE WHEN ? OR ? THEN 0 ELSE rest_alerted END,
+                    updated_at=CURRENT_TIMESTAMP
                 WHERE id=?
                 """,
                 (
@@ -538,12 +586,15 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
                     int(data.failure),
                     data.notes,
                     int(data.skipped),
-                    int(newly_logged), now,
+                    int(data.skipped), int(newly_logged), now,
+                    int(data.skipped), int(newly_logged),
                     entry_id,
                 ),
             )
             if not data.skipped and session and session["template_id"] and session["status"] == "in_progress" and self._template_unchanged(conn, session):
                 self._update_template_defaults_conn(conn, session["template_id"], data)
+            elif data.skipped and not old["skipped"]:
+                self._restore_template_defaults_conn(conn, session, old)
             conn.execute(
                 """
                 UPDATE workout_sessions SET last_activity_at=?,
@@ -551,34 +602,78 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
                 """,
                 (now, int(newly_logged), now, old["session_id"]),
             )
+            if data.skipped and not old["skipped"]:
+                self._restore_rest_conn(conn, old["session_id"])
+
+    def _restore_template_defaults_conn(self, conn, session, entry):
+        """Undo only this entry's remembered defaults, preserving newer edits."""
+        if session["created_new_template"] or entry["skipped"] or not self._template_unchanged(conn, session):
+            return
+        newer = conn.execute(
+            "SELECT 1 FROM workout_entries e JOIN workout_sessions s ON s.id=e.session_id "
+            "WHERE s.template_id=? AND s.status<>'discarded' AND e.exercise_id=? AND e.skipped=0 "
+            "AND e.id>? AND e.measurement_type=? AND e.unit=? AND e.resistance_unit IS ? LIMIT 1",
+            (session["template_id"], entry["exercise_id"], entry["id"], entry["measurement_type"],
+             entry["unit"], entry["resistance_unit"]),
+        ).fetchone()
+        if newer:
+            return
+        frozen = conn.execute(
+            "SELECT * FROM workout_session_exercises WHERE session_id=? AND exercise_id=?",
+            (session["id"], entry["exercise_id"]),
+        ).fetchone()
+        if not frozen:
+            return
+        assignments = ", ".join(f"{field}=?" for field in _DEFAULT_FIELDS)
+        matches = " AND ".join(f"{field} IS ?" for field in _DEFAULT_FIELDS)
+        conn.execute(
+            f"UPDATE workout_template_exercises SET {assignments} WHERE template_id=? AND exercise_id=? "
+            "AND measurement_type_snapshot=? AND unit_snapshot=? AND resistance_unit_snapshot IS ? "
+            f"AND {matches}",
+            (*[frozen[field] for field in _DEFAULT_FIELDS], session["template_id"], entry["exercise_id"],
+             entry["measurement_type"], entry["unit"], entry["resistance_unit"],
+             *[entry[field.removeprefix("default_")] for field in _DEFAULT_FIELDS]),
+        )
+
+    @staticmethod
+    def _restore_rest_conn(conn, session_id):
+        remaining_set = conn.execute(
+            "SELECT COALESCE(logged_at,created_at) AS logged_at,rest_alerted FROM workout_entries "
+            "WHERE session_id=? AND skipped=0 ORDER BY julianday(COALESCE(logged_at,created_at)) DESC,id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        rest = remaining_set["logged_at"] if remaining_set else None
+        alerted = rest if remaining_set and remaining_set["rest_alerted"] else None
+        conn.execute(
+            "UPDATE workout_sessions SET rest_started_at=?,rest_alerted_for=? WHERE id=?",
+            (rest, alerted, session_id),
+        )
 
     def undo_last_entry(self, session_id: int) -> Optional[dict]:
         session = self.get_session(session_id)
         if not session or session["status"] != "in_progress":
             raise ValueError("Only an active session can be undone")
         row = self.db.fetchone(
-            "SELECT * FROM workout_entries WHERE session_id=? ORDER BY exercise_order DESC, id DESC LIMIT 1",
+            "SELECT * FROM workout_entries WHERE session_id=? ORDER BY id DESC LIMIT 1",
             (session_id,),
         )
         if not row:
             return None
         entry = dict(row)
         with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._active_timing_session(conn, session_id)
+            self._restore_template_defaults_conn(conn, session, entry)
             conn.execute("DELETE FROM workout_entries WHERE id=?", (entry["id"],))
-            if session and session["created_new_template"] and self._template_unchanged(conn, session):
+            if session and session["created_new_template"] and self._template_unchanged(conn, session, include_config=False):
                 conn.execute(
                     "DELETE FROM workout_template_exercises WHERE template_id=? AND exercise_id=?",
                     (session["template_id"], entry["exercise_id"]),
                 )
-            remaining_set = conn.execute(
-                "SELECT COALESCE(logged_at,created_at) AS logged_at,rest_alerted FROM workout_entries WHERE session_id=? AND skipped=0 ORDER BY julianday(COALESCE(logged_at,created_at)) DESC,id DESC LIMIT 1",
-                (session_id,),
-            ).fetchone()
-            rest = remaining_set["logged_at"] if remaining_set else None
-            alerted = rest if remaining_set and remaining_set["rest_alerted"] else None
+            self._restore_rest_conn(conn, session_id)
             conn.execute(
-                "UPDATE workout_sessions SET last_activity_at=?,rest_started_at=?,rest_alerted_for=? WHERE id=?",
-                (self._timing_now().isoformat(timespec="microseconds"), rest, alerted, session_id),
+                "UPDATE workout_sessions SET last_activity_at=? WHERE id=?",
+                (self._timing_now().isoformat(timespec="microseconds"), session_id),
             )
         return entry
 
@@ -598,9 +693,11 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
         remaining = len(self.remaining_for_session(session_id))
         incomplete = force_incomplete or remaining > 0 or completed < session["planned_total"]
         status = "incomplete" if incomplete else "complete"
-        now = datetime.now().isoformat(timespec="seconds")
+        moment = current_time(self._timing_now())
+        now = moment.isoformat(timespec="microseconds")
         with self.db.connect() as conn:
-            self._finish_session_timing_conn(conn, session_id)
+            conn.execute("BEGIN IMMEDIATE")
+            self._finish_session_timing_conn(conn, session_id, now=moment)
             conn.execute(
                 "UPDATE workout_sessions SET status=?, completed_at=?, last_activity_at=? WHERE id=?",
                 (status, now, now, session_id),
@@ -637,10 +734,15 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
             return
         if session["status"] != "in_progress":
             raise ValueError("Only an unfinished workout can be discarded")
+        moment = current_time(self._timing_now())
         with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._finish_session_timing_conn(conn, session_id, now=moment)
+            for entry in conn.execute("SELECT * FROM workout_entries WHERE session_id=?", (session_id,)).fetchall():
+                self._restore_template_defaults_conn(conn, session, dict(entry))
             conn.execute(
-                "UPDATE workout_sessions SET status='discarded', last_activity_at=? WHERE id=?",
-                (datetime.now().astimezone().isoformat(timespec="seconds"), session_id),
+                "UPDATE workout_sessions SET status='discarded', completed_at=?, last_activity_at=? WHERE id=?",
+                (moment.isoformat(timespec="microseconds"), moment.isoformat(timespec="microseconds"), session_id),
             )
             if session["created_new_template"] and session["template_id"]:
                 uses = conn.execute(
@@ -652,7 +754,7 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
                     self._relabel_templates_conn(conn)
 
     # ---------- history ----------
-    def workout_history(self, limit: int = 100):
+    def workout_history(self, limit: int | None = None):
         rows = self.db.fetchall(
             """
             SELECT s.*, COALESCE(s.template_label_snapshot, t.label) AS template_label,
@@ -669,11 +771,11 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
             ORDER BY s.session_date DESC, s.id DESC
             LIMIT ?
             """,
-            (limit,),
+            (-1 if limit is None else limit,),
         )
         return [dict(r) for r in rows]
 
-    def exercise_history(self, exercise_id: int, limit: int = 100):
+    def exercise_history(self, exercise_id: int, limit: int | None = None):
         rows = self.db.fetchall(
             """
             SELECT we.*, ws.session_date, ws.bodyweight AS session_bodyweight,
@@ -688,11 +790,11 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
             ORDER BY ws.session_date DESC, ws.id DESC
             LIMIT ?
             """,
-            (exercise_id, limit),
+            (exercise_id, -1 if limit is None else limit),
         )
         return [dict(r) for r in rows]
 
-    def bodyweight_history(self, limit: int = 100):
+    def bodyweight_history(self, limit: int | None = None):
         rows = self.db.fetchall(
             """
             SELECT bw.*, s.status
@@ -702,6 +804,6 @@ class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
             ORDER BY bw.entry_date DESC, bw.id DESC
             LIMIT ?
             """,
-            (limit,),
+            (-1 if limit is None else limit,),
         )
         return [dict(r) for r in rows]

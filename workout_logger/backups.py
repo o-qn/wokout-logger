@@ -6,6 +6,7 @@ but can never replace an existing result, correction, exercise, or setting.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -13,6 +14,8 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+from .database import check_schema_version
 
 
 class BackupError(ValueError):
@@ -85,6 +88,18 @@ def _uuid(conn: sqlite3.Connection) -> str | None:
     return str(row[0]) if row and row[0] else None
 
 
+def _legacy_source_key(conn: sqlite3.Connection) -> str:
+    # Pre-UUID snapshots have no shared database identity. Namespace their
+    # recovery mappings by contents so two unrelated snapshots cannot reuse
+    # another snapshot's source IDs/timestamps. Original rows still deduplicate
+    # by their natural identities when importing overlapping old snapshots.
+    digest = hashlib.sha256()
+    for statement in conn.iterdump():
+        digest.update(statement.encode())
+        digest.update(b"\0")
+    return "legacy:" + digest.hexdigest()
+
+
 class BackupManager:
     def __init__(self, db_or_path, backup_dir: Path | str | None = None):
         self.path = Path(getattr(db_or_path, "path", db_or_path)).expanduser()
@@ -95,9 +110,19 @@ class BackupManager:
         if not self.path.exists():
             return None
         prefix = f"workouts-{datetime.now().date().isoformat()}--daily--"
-        for info in self.list_backups():
-            if info.valid and info.path.name.startswith(prefix):
-                return None
+        # Startup only needs today's daily snapshot. Validating the entire
+        # retained archive makes every launch progressively slower.
+        if self.backup_dir.is_dir():
+            for path in self.backup_dir.glob(f"{prefix}*.db"):
+                try:
+                    snapshot = _readonly(path)
+                    try:
+                        _validate(snapshot)
+                    finally:
+                        snapshot.close()
+                    return None
+                except (BackupError, sqlite3.Error, OSError):
+                    continue
         return self.create_backup("daily")
 
     def create_backup(self, reason: str = "manual") -> Path:
@@ -170,6 +195,7 @@ class BackupManager:
                 raise BackupError(f"Recovery destination already exists: {destination}. Choose a new path.")
             source = _readonly(source_path)
             _validate(source)
+            check_schema_version(source)
             destination.parent.mkdir(parents=True, exist_ok=True)
             fd, temporary = tempfile.mkstemp(prefix=".recovery-", suffix=".tmp", dir=destination.parent)
             os.close(fd)
@@ -202,19 +228,22 @@ class BackupManager:
         live = None
         try:
             source = _readonly(source_path)
+            source.execute("BEGIN")
             _validate(source)
+            check_schema_version(source)
             if not self.path.is_file():
                 raise BackupError(f"Live database does not exist: {self.path}")
             live = sqlite3.connect(self.path)
             live.row_factory = sqlite3.Row
             live.execute("PRAGMA foreign_keys=ON")
             _validate(live)
+            check_schema_version(live)
             source_uuid, live_uuid = _uuid(source), _uuid(live)
             if source_uuid and live_uuid and source_uuid != live_uuid:
                 raise BackupError("This snapshot belongs to a different workout database. Recovery was not applied.")
-            pre_restore = self.create_backup("before-recovery")
             live.execute("BEGIN IMMEDIATE")
-            result = self._merge(source, live, source_uuid or "legacy", pre_restore)
+            pre_restore = self.create_backup("before-recovery")
+            result = self._merge(source, live, source_uuid or _legacy_source_key(source), pre_restore)
             if live.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise BackupError("Recovery could not preserve all record references; no recovery changes were saved.")
             live.commit()
@@ -245,10 +274,37 @@ class BackupManager:
             table: {r["id"]: dict(r) for r in live.execute(f'SELECT * FROM "{table}"')}
             for table in ("exercises", "workout_templates", "workout_sessions")
         }
+        legacy_exercises, legacy_templates = set(), set()
+        if source_key.startswith("legacy:"):
+            # A shared immutable entry snapshot ties renamed exercises and
+            # relettered templates to their old IDs more strongly than names
+            # or second-resolution creation times alone can do.
+            source_sessions = {row["id"]: dict(row) for row in source.execute("SELECT * FROM workout_sessions")}
+            live_entries = {
+                (row["session_id"], row["exercise_id"]): dict(row)
+                for row in live.execute("SELECT * FROM workout_entries")
+            }
+            for entry in source.execute("SELECT * FROM workout_entries"):
+                source_session = source_sessions[entry["session_id"]]
+                live_session = original_rows["workout_sessions"].get(entry["session_id"])
+                live_entry = live_entries.get((entry["session_id"], entry["exercise_id"]))
+                if (
+                    live_session and live_entry
+                    and live_session["started_at"] == source_session["started_at"]
+                    and live_entry["exercise_name_snapshot"] == entry["exercise_name_snapshot"]
+                ):
+                    legacy_exercises.add(entry["exercise_id"])
+                    if live_session["template_id"] == source_session["template_id"]:
+                        legacy_templates.add(source_session["template_id"])
         counts = {"workout_sessions": 0, "workout_entries": 0, "bodyweight_entries": 0, "exercises": 0, "workout_templates": 0}
         maps: dict[str, dict[int, int]] = {}
 
         def signature(table, row):
+            if table == "workout_revisions":
+                # Audit records are immutable. Different corrections can share
+                # an ID and timestamp in separate legacy databases.
+                identity = json.dumps(row, sort_keys=True, separators=(",", ":"))
+                return hashlib.sha256(identity.encode()).hexdigest()
             if table == "workout_sessions":
                 identity = row.get("started_at")
             elif table == "workout_pause_intervals":
@@ -266,6 +322,27 @@ class BackupManager:
             ).fetchone()
             if entry and live.execute(f'SELECT 1 FROM "{table}" WHERE id=?', (entry[0],)).fetchone():
                 return entry[0]
+            if source_key.startswith("legacy:"):
+                # Older app versions used one shared namespace for all legacy
+                # imports. Adopt an old mapping only when the referenced row
+                # still corroborates it, preserving recovery idempotence after
+                # upgrading without trusting another snapshot's ID alone.
+                previous = live.execute(
+                    "SELECT target_id FROM backup_recovery_map WHERE source_key='legacy' AND table_name=? AND source_id=? AND signature=?",
+                    (table, row["id"], signature(table, row)),
+                ).fetchone()
+                target = live.execute(f'SELECT * FROM "{table}" WHERE id=?', (previous[0],)).fetchone() if previous else None
+                if target:
+                    if table == "exercises" and target["name"] == row["name"]:
+                        return target["id"]
+                    if table == "workout_templates" and target["created_at"] == row["created_at"]:
+                        recovered_label = rf"Recovered {re.escape(row['label'])} \({row['id']}(?:-\d+)?\)"
+                        if target["label"] == row["label"] or (not target["active"] and re.fullmatch(recovered_label, target["label"])):
+                            return target["id"]
+                    if table == "workout_sessions" and target["started_at"] == row["started_at"] and target["template_id"] == maps.get("workout_templates", {}).get(row["template_id"]):
+                        return target["id"]
+                    if table == "workout_pause_intervals" and target["paused_at"] == row["paused_at"] and target["session_id"] == maps.get("workout_sessions", {}).get(row["session_id"]):
+                        return target["id"]
             return None
 
         def remember(table, row, target_id):
@@ -291,7 +368,10 @@ class BackupManager:
             target_id = remembered("exercises", row)
             if target_id is None:
                 existing = original_rows["exercises"].get(row["id"])
-                if existing and (source_key != "legacy" or existing["created_at"] == row.get("created_at") or existing["name"] == row["name"]):
+                if existing and (
+                    not source_key.startswith("legacy:") or existing["name"] == row["name"]
+                    or row["id"] in legacy_exercises
+                ):
                     target_id = existing["id"]
                 else:
                     named = live.execute("SELECT id FROM exercises WHERE name=?", (row["name"],)).fetchone()
@@ -306,7 +386,10 @@ class BackupManager:
             target_id = remembered("workout_templates", row)
             if target_id is None:
                 existing = original_rows["workout_templates"].get(row["id"])
-                if existing and existing["created_at"] == row["created_at"]:
+                if existing and existing["created_at"] == row["created_at"] and (
+                    not source_key.startswith("legacy:") or existing["label"] == row["label"]
+                    or row["id"] in legacy_templates
+                ):
                     target_id = existing["id"]
                 else:
                     label = row["label"]
@@ -335,7 +418,9 @@ class BackupManager:
             target_id = remembered("workout_sessions", row)
             if target_id is None:
                 existing = original_rows["workout_sessions"].get(row["id"])
-                if existing and existing["started_at"] == row["started_at"]:
+                if existing and existing["started_at"] == row["started_at"] and (
+                    existing["template_id"] == maps.get("workout_templates", {}).get(row["template_id"])
+                ):
                     target_id = existing["id"]
                 else:
                     changes = {"template_id": maps.get("workout_templates", {}).get(row["template_id"])}
@@ -380,17 +465,24 @@ class BackupManager:
                 remember("workout_pause_intervals", row, target_id)
 
         if "workout_revisions" in source_tables and "workout_revisions" in live_tables:
+            matched_revisions = set()
             for raw in source.execute("SELECT * FROM workout_revisions ORDER BY id"):
                 row = dict(raw)
-                if remembered("workout_revisions", row) is not None:
+                remembered_id = remembered("workout_revisions", row)
+                if remembered_id is not None:
+                    matched_revisions.add(remembered_id)
                     continue
                 changes = {"session_id": maps["workout_sessions"][row["session_id"]], "entry_id": maps.get("workout_entries", {}).get(row.get("entry_id"))}
                 # Avoid duplicating an audit row already present in the live DB.
-                existing = live.execute(
-                    "SELECT id FROM workout_revisions WHERE session_id=? AND entry_id IS ? AND change_type=? AND before_json=? AND after_json=? AND created_at=?",
-                    (changes["session_id"], changes["entry_id"], row["change_type"], row["before_json"], row["after_json"], row["created_at"]),
-                ).fetchone()
+                # Match each live record only once: repeated corrections in the
+                # same second are still distinct history records.
+                candidates = live.execute(
+                    "SELECT id FROM workout_revisions WHERE session_id=? AND entry_id IS ? AND change_type=? AND before_json=? AND after_json=? AND reason=? AND created_at=? ORDER BY id",
+                    (changes["session_id"], changes["entry_id"], row["change_type"], row["before_json"], row["after_json"], row.get("reason", ""), row["created_at"]),
+                ).fetchall()
+                existing = next((item for item in candidates if item[0] not in matched_revisions), None)
                 target_id = existing[0] if existing else insert("workout_revisions", row, changes)
+                matched_revisions.add(target_id)
                 remember("workout_revisions", row, target_id)
 
         return RecoveryResult(counts["workout_sessions"], counts["workout_entries"], counts["bodyweight_entries"], counts["exercises"], counts["workout_templates"], pre_restore)

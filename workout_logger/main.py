@@ -11,11 +11,14 @@ from typing import Optional
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
+from rich.text import Text
+from rich.markup import escape
 
-from .database import Database
+from .database import Database, UnsupportedSchemaError
 from .backups import BackupManager, BackupError
 from .exports.excel_export import ExcelExporter
 from .models import WorkoutEntryData, MEASUREMENT_TYPES
+from .measurements import measurement_unit
 from .notation import format_entry, comparison_message, decimal_text
 from .services.workout_service import WorkoutService
 from .ui.prompts import (
@@ -31,19 +34,32 @@ from .services.comparison import COMPARISON_MODES
 console = Console()
 
 
+class RecoverySelectionError(ValueError):
+    def __init__(self, message, data_dir, export_path):
+        super().__init__(message)
+        self.data_dir = data_dir
+        self.export_path = export_path
+
+
 def app_paths():
     data_dir = Path(os.environ.get("WORKOUT_LOGGER_DATA_DIR", "~/.local/share/workout_logger")).expanduser()
     export_path = Path(os.environ.get("WORKOUT_LOGGER_EXPORT", "~/workout_history.xlsx")).expanduser()
     db_path = data_dir / "workouts.db"
     pointer = data_dir / "active-recovery.json"
     try:
-        filename = json.loads(pointer.read_text())["database"]
+        contents = pointer.read_text()
+    except FileNotFoundError:
+        return db_path, export_path
+    except (OSError, UnicodeError) as exc:
+        raise RecoverySelectionError(f"The selected recovery database could not be read: {exc}", data_dir, export_path) from exc
+    try:
+        filename = json.loads(contents)["database"]
         candidate = data_dir / filename
-        if Path(filename).name == filename and filename.startswith("recovered-") and candidate.is_file():
-            db_path = candidate
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return db_path, export_path
+        if Path(filename).name != filename or not filename.startswith("recovered-") or not candidate.is_file():
+            raise ValueError("the selected recovery file is missing or invalid")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RecoverySelectionError(f"Could not open the selected recovery database: {exc}", data_dir, export_path) from exc
+    return candidate, export_path
 
 
 def header():
@@ -54,9 +70,9 @@ def header():
 def export_now(exporter: ExcelExporter, export_path: Path):
     try:
         path = exporter.export(export_path)
-        console.print(f"[green]Excel updated:[/green] {path}")
+        console.print(f"[green]Excel updated:[/green] {escape(str(path))}")
     except Exception as exc:
-        console.print(f"[yellow]Workout is safely stored in SQLite, but Excel export failed:[/yellow] {exc}")
+        console.print(f"[yellow]Workout is safely stored in SQLite, but Excel export failed:[/yellow] {escape(str(exc))}")
 
 
 def session_summary(service: WorkoutService, session_id: int):
@@ -74,9 +90,9 @@ def session_summary(service: WorkoutService, session_id: int):
         if session.get("comparison_mode") == "matching":
             check = check.replace("vs previous session", "vs matching session")
         if previous and not entry["skipped"]:
-            check = f"{previous['session_date']}: {format_entry({**previous, 'notes': ''})}\n{check}"
+            check = f"{format_entry({**previous, 'notes': ''})}\n{check}"
         empty = "No earlier matching load/settings" if session.get("comparison_mode") == "matching" else "No earlier performance"
-        table.add_row(str(i), entry["exercise_name_snapshot"], format_entry(entry), check or empty)
+        table.add_row(str(i), Text(entry["exercise_name_snapshot"]), Text(format_entry(entry)), Text(check or empty))
     if not entries:
         table.add_row("—", "No entries yet", "", "")
     console.print(table)
@@ -163,7 +179,7 @@ def _entry_action(service: WorkoutService, session_id: int, exercise: dict, defa
     previous = service.comparison_preview(exercise, defaults, session_id)
     session = service.get_session(session_id)
     header()
-    console.print(f"[bold cyan]{exercise['name']}[/bold cyan]")
+    console.print(f"[bold cyan]{escape(exercise['name'])}[/bold cyan]")
     show_previous(previous, session["bodyweight"])
 
     has_settings = exercise["measurement_type"] in {"external_weight", "bodyweight_plus", "assistance", "isometric", "resistance_units"}
@@ -210,7 +226,7 @@ def _log_one(service: WorkoutService, session_id: int, exercise: dict, defaults:
             undone = service.undo_last_entry(session_id)
             refresh_active_timer(session_id)
             if undone:
-                console.print(f"[yellow]Undid:[/yellow] {undone['exercise_name_snapshot']}")
+                console.print(f"[yellow]Undid:[/yellow] {escape(undone['exercise_name_snapshot'])}")
             return "restart"
         if action == "end":
             return "end"
@@ -247,7 +263,7 @@ def _log_one(service: WorkoutService, session_id: int, exercise: dict, defaults:
             if service.get_session(session_id).get("comparison_mode") == "matching":
                 comparison = comparison.replace("vs previous session", "vs matching session")
             comparison += f" (comparison date: {previous['session_date']})"
-            console.print(f"[green]{comparison}[/green]")
+            console.print(f"[green]{escape(comparison)}[/green]")
         return "logged"
 
 
@@ -349,7 +365,7 @@ def edit_session_entry(service: WorkoutService, session_id: int):
         "resistance_unit": old["resistance_unit"] or frozen.get("resistance_unit"),
     }
     header()
-    console.print(f"[bold]Editing {old['exercise_name_snapshot']}[/bold]")
+    console.print(f"[bold]Editing {escape(old['exercise_name_snapshot'])}[/bold]")
     if old["skipped"]:
         action = select("This entry is SKIPPED:", [Choice("Log it now", "log"), Choice("Keep skipped", "back")])
         if action != "log":
@@ -458,12 +474,12 @@ def exercise_history(service: WorkoutService):
     ex = service.get_exercise(ex_id)
     rows = service.exercise_history(ex_id)
     header()
-    table = Table(title=ex["name"])
+    table = Table(title=Text(ex["name"]))
     table.add_column("Date")
     table.add_column("Workout")
     table.add_column("Performance")
     for r in rows:
-        table.add_row(r["session_date"], r["workout_name"], format_entry(r))
+        table.add_row(r["session_date"], r["workout_name"], Text(format_entry(r)))
     if not rows:
         table.add_row("—", "—", "No history")
     console.print(table)
@@ -532,15 +548,19 @@ def manage_exercises(service: WorkoutService):
             mode = select("Measurement type:", measurement_type_choices())
             if not mode:
                 continue
-            unit = text("Default unit:", "kg" if mode not in {"isometric", "amrap", "custom"} else ("sec" if mode == "isometric" else "reps"))
+            unit = text("Default unit:", measurement_unit(mode))
+            if unit is None:
+                continue
             r_unit = None
             if mode == "resistance_units":
                 r_unit = text("Resistance unit (e.g. springs):", "springs")
+                if r_unit is None:
+                    continue
             try:
-                service.add_exercise(name.strip(), mode, unit or "kg", r_unit.strip() if r_unit else None)
+                service.add_exercise(name.strip(), mode, unit.strip() or measurement_unit(mode), r_unit.strip() if r_unit else None)
                 console.print("[green]Exercise added.[/green]")
             except Exception as exc:
-                console.print(f"[red]Could not add exercise:[/red] {exc}")
+                console.print(f"[red]Could not add exercise:[/red] {escape(str(exc))}")
         elif action == "edit":
             exercises = service.all_exercises()
             ex_id = select("Exercise:", [Choice(e["name"], e["id"]) for e in exercises] + [Choice("← Back", None)])
@@ -562,7 +582,7 @@ def manage_exercises(service: WorkoutService):
             elif sub == "mode":
                 v = select("Measurement type:", measurement_type_choices(), default=ex["measurement_type"])
                 if v and v != ex["measurement_type"]:
-                    suggested_unit = {"isometric": "sec", "amrap": "reps", "custom": "units", "resistance_units": "units"}.get(v, "kg")
+                    suggested_unit = measurement_unit(v, previous=ex["default_unit"])
                     unit = text("Default unit:", suggested_unit)
                     if unit is None:
                         continue
@@ -595,7 +615,7 @@ def manage_exercises(service: WorkoutService):
 
 
 def recover_startup_database(database_path: Path, error):
-    console.print(f"[yellow]The workout database could not be opened:[/yellow] {error}")
+    console.print(f"[yellow]The workout database could not be opened:[/yellow] {escape(str(error))}")
     manager = BackupManager(database_path)
     snapshots = [item for item in manager.list_backups() if item.valid]
     choices = [Choice(f"{item.created_at} • {item.sessions} workouts / {item.entries} results", item.path) for item in snapshots]
@@ -619,12 +639,27 @@ def recover_startup_database(database_path: Path, error):
         console.print("[green]Recovery copy opened. Your original database is still preserved.[/green]")
         return destination
     except (BackupError, OSError) as exc:
-        console.print(f"[red]Recovery could not be opened:[/red] {exc}")
+        console.print(f"[red]Recovery could not be opened:[/red] {escape(str(exc))}")
         return None
 
 
 def run():
-    db_path, export_path = app_paths()
+    try:
+        _run()
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]Safe exit. Completed exercise entries and in-progress sessions are already autosaved.[/yellow]")
+    except (OSError, sqlite3.Error) as exc:
+        console.print(f"[red]The app could not complete this operation:[/red] {escape(str(exc))}")
+
+
+def _run():
+    try:
+        db_path, export_path = app_paths()
+    except RecoverySelectionError as exc:
+        db_path = recover_startup_database(exc.data_dir / "workouts.db", exc)
+        if db_path is None:
+            return
+        export_path = exc.export_path
     backup_warning = None
     try:
         BackupManager(db_path).daily_backup()
@@ -634,6 +669,9 @@ def run():
         db = Database(db_path)
         if db.fetchone("PRAGMA quick_check")[0] != "ok":
             raise sqlite3.DatabaseError("Database integrity check failed")
+    except UnsupportedSchemaError as exc:
+        console.print(str(exc), style="red", markup=False)
+        return
     except sqlite3.DatabaseError as exc:
         recovered = recover_startup_database(db_path, exc)
         if recovered is None:
@@ -645,6 +683,7 @@ def run():
     exporter = ExcelExporter(db)
     try:
         service.backups.daily_backup()
+        backup_warning = None
     except Exception as exc:
         backup_warning = str(exc)
 
@@ -653,7 +692,7 @@ def run():
             header()
             warning = backup_warning or getattr(service, "backup_warning", None)
             if warning:
-                console.print(f"[yellow]Automatic backup needs attention:[/yellow] {warning}")
+                console.print(f"[yellow]Automatic backup needs attention:[/yellow] {escape(str(warning))}")
             unfinished = service.unfinished_sessions()
             choices = [Choice("Start workout", "start")]
             if unfinished:
@@ -696,7 +735,7 @@ def run():
                     export_now(exporter, export_path)
                     input("Press Enter to return...")
             except (BackupError, OSError, ValueError, sqlite3.Error) as exc:
-                console.print(f"[red]Could not complete this action:[/red] {exc}")
+                console.print(f"[red]Could not complete this action:[/red] {escape(str(exc))}")
                 input("Press Enter to return to the main menu...")
     except (KeyboardInterrupt, EOFError):
         console.print("\n[yellow]Safe exit. Completed exercise entries and in-progress sessions are already autosaved.[/yellow]")

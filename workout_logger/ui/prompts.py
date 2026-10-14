@@ -13,6 +13,7 @@ from prompt_toolkit.shortcuts import prompt
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Label, RadioList, TextArea
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 
 from ..models import MEASUREMENT_TYPES, WorkoutEntryData
@@ -109,8 +110,14 @@ def select(message: str, choices, default=None):
 
 
 def text(message: str, default: str = "") -> Optional[str]:
+    kb = KeyBindings()
+
+    @kb.add("escape")
+    def cancel(event):
+        event.app.exit(result=None)
+
     if not timer_text():
-        return prompt(f"{message} ", default=default)
+        return prompt(f"{message} ", default=default, key_bindings=kb)
 
     def accept(buffer):
         get_app().exit(result=buffer.text)
@@ -120,12 +127,6 @@ def text(message: str, default: str = "") -> Optional[str]:
     # cursor and completion state intact while a load/reps/note is being typed.
     field = TextArea(text=default, prompt=f"{message} ", multiline=False, height=1, accept_handler=accept)
     field.buffer.cursor_position = len(default)
-    kb = KeyBindings()
-
-    @kb.add("escape")
-    def cancel(event):
-        event.app.exit(result=None)
-
     @kb.add("c-c")
     def interrupt(event):
         event.app.exit(exception=KeyboardInterrupt())
@@ -213,19 +214,19 @@ def ask_rir(default: Optional[str] = None) -> Optional[str]:
 
 def show_previous(previous: Optional[Mapping[str, Any]], bodyweight: str):
     if previous:
-        performance = format_entry(previous)
-        note = previous.get("notes") or "—"
-        previous_bw = previous.get("bodyweight") or "—"
-        previous_date = previous.get("session_date") or "unknown date"
+        performance = escape(format_entry(previous))
+        note = escape(str(previous.get("notes") or "—"))
+        previous_bw = escape(str(previous.get("bodyweight") or "—"))
+        previous_date = escape(str(previous.get("session_date") or "unknown date"))
         content = (
             f"[bold]Previous date:[/bold] {previous_date}\n"
             f"[bold]Previous:[/bold] {performance}\n"
             f"[bold]Previous BW:[/bold] {previous_bw} kg\n"
             f"[bold]Previous note:[/bold] {note}\n"
-            f"[bold]Today BW:[/bold] {bodyweight} kg"
+            f"[bold]Today BW:[/bold] {escape(str(bodyweight))} kg"
         )
     else:
-        content = f"[bold]Previous:[/bold] no earlier entry\n[bold]Today BW:[/bold] {bodyweight} kg"
+        content = f"[bold]Previous:[/bold] no earlier entry\n[bold]Today BW:[/bold] {escape(str(bodyweight))} kg"
     console.print(Panel(content, border_style="blue"))
 
 
@@ -271,7 +272,7 @@ def prompt_entry(
         data.reps = ask_int("Reps:", _value(existing, "reps"), 0)
     elif mode == "bodyweight_plus":
         prev = _value(base, "external_load", "default_external_load")
-        data.external_load = ask_decimal(f"Added load ({unit}):", prev) if update_settings or prev is None else Decimal(str(prev))
+        data.external_load = ask_decimal(f"Added weight ({unit}):", prev) if update_settings or prev is None else Decimal(str(prev))
         if data.external_load is None:
             return None
         data.reps = ask_int("Reps:", _value(existing, "reps"), 0)

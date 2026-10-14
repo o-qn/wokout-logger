@@ -26,6 +26,7 @@ A keyboard-first Linux terminal workout logger for one-set full-body training. I
 - In-progress-session recovery after terminal interruption.
 - Workout, exercise, and bodyweight history.
 - Exercise add/rename/archive/configuration controls.
+- Complete history views without a 100-workout cutoff.
 - Atomic `.xlsx` export with Workouts, Exercise History, Bodyweight, and Raw Data sheets.
 - Decimal values are stored as strings / `Decimal` values rather than binary floats.
 
@@ -59,7 +60,11 @@ The versioned schema uses these main tables:
 
 Workout entries snapshot the exercise name, measurement type, units, load/settings, bodyweight, reps/time, RIR, notes, order, and skipped state. This means renaming or reconfiguring an exercise later does not rewrite historical data.
 
+Starting a workout saves its template, session, and weigh-in together. Invalid input or a failed save leaves no partial workout template. Active edits and Undo require an unpaused active session. Undo follows the most recent logged or skipped result, restores the previous remembered settings when appropriate, and preserves settings supplied by a later session.
+
 Templates remember load/settings. Each session snapshots the current exercise configuration when it starts, so changes in **Manage exercises** apply to the next session, including repeats of existing templates. Sessions already started and historical entries retain their original names, measurements and units. Changing a measurement type or unit clears incompatible remembered settings and prompts for new values. When an existing template is repeated, you normally only enter reps, RIR, and optional notes unless you select **Update load/settings**.
+
+Weight-based modes use weight units (`kg`, `lb`, `g`, or `oz`). Changing AMRAP to bodyweight plus external weight defaults the new unit to `kg`, and prompts separately for **Added weight (kg)** and **Reps**. Switching between weight-based modes can retain a compatible weight unit. An earlier AMRAP result remains AMRAP in history; the first comparison after changing modes reports **Measurement changed**.
 
 **Start workout → Remove workout template** hides a template and reletters the remaining active templates A/B/C. It preserves every saved session, exercise result and weigh-in. Sessions belonging to a removed template appear as **Removed Workout A** (or their original session letter), alongside their date, in history and Excel. Historical letters stay fixed even when active templates receive new letters.
 
@@ -67,7 +72,7 @@ Workout time starts at zero when the session is created. Rest time begins after 
 
 The summary compares each result with the latest earlier non-skipped result for that exercise. At matching load/settings and RIR, an extra rep is **+1 rep**. When RIR differs, the **technical** change is `(current reps + current RIR) − (previous reps + previous RIR)`: for example, 6 reps at 0 RIR or F followed by 6 at 1 RIR is **+1 technical**; 6 at 2 RIR is **+2 technical**. F counts as zero in this calculation, but transitions between F and 0 RIR are explicitly shown. Missing RIR or changed load, units, measurement mode, or bodyweight for bodyweight-based exercises produces descriptive context instead of an improvement claim.
 
-Use **Change comparison baseline** during a session or when viewing a saved workout to choose **Previous session** or **Last session with matching load/settings**. Comparisons show the source date, result, and RIR, and exclude later workouts. **Preferences → Comparison baseline** sets the default for new sessions.
+Use **Change comparison baseline** during a session or when viewing a saved workout to choose **Previous session** or **Last session with matching load/settings**. Summary comparisons show the source result and RIR without a date prefix, and exclude later workouts. The workout date remains in the summary heading. **Preferences → Comparison baseline** sets the default for new sessions.
 
 ## Templates and saved corrections
 
@@ -82,6 +87,8 @@ Backups are stored in a `backups/` folder beside the database. The app makes one
 Use **Backups and recovery** to create or inspect snapshots, or recover missing history. Recovery adds missing sessions, results, weigh-ins, and audit records while preserving existing workouts, corrections, and preferences. Running recovery again does not duplicate the imported records. It also makes a backup before recovery.
 
 If the database cannot be opened, startup offers a validated backup as a separate recovery copy. The original database and its journal files remain available. Subsequent launches use the recovery copy selected in `active-recovery.json` beside the database.
+
+A missing or damaged recovery selection offers recovery again instead of silently opening an older or empty database. Database upgrades apply atomically; failed upgrades roll back. A database created by a newer app requires that newer version and is never downgraded automatically.
 
 ## Rest reminders
 
@@ -161,7 +168,7 @@ A session row and bodyweight entry are written as soon as the workout begins. Ev
 
 ## Excel layout
 
-The exporter rebuilds the workbook from SQLite, so the spreadsheet is a view rather than the database.
+The exporter rebuilds the workbook from one consistent SQLite snapshot, so the spreadsheet is a view rather than the database. Names, notes, and custom results remain literal text, including strings beginning with `=`. All five workout metadata rows stay frozen while scrolling. A failed export preserves the previous workbook, and the export path cannot overwrite the live database or its journal files.
 
 ### Workouts
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -35,6 +36,42 @@ def _historical_resistance_unit(entry):
         return entry.get("resistance_unit")
     candidate = (entry.get("unit") or "").strip()
     return candidate if candidate.lower() not in {"", "kg", "lb", "lbs", "sec", "seconds", "reps"} else "units"
+
+
+def _validated_entry(data: WorkoutEntryData, *, require_rir=False) -> WorkoutEntryData:
+    """Validate writes before they can change entries, defaults, or timers."""
+    changes = {}
+    for field in (*_DECIMAL_FIELDS, "bodyweight"):
+        value = getattr(data, field)
+        if value is not None:
+            changes[field] = _nonnegative(value, field.replace("_", " "))
+    for field, minimum in (("reps", 0), ("rounds", 1)):
+        value = getattr(data, field)
+        if value is not None:
+            changes[field] = _whole(value, field, minimum)
+    if not isinstance(data.skipped, (bool, int)) or data.skipped not in (False, True, 0, 1):
+        raise ValueError("Skipped must be true or false")
+    rir = str(data.rir_code).strip().upper() if data.rir_code not in (None, "") else None
+    if rir not in (None, "F"):
+        if not rir.isascii() or not rir.isdigit():
+            raise ValueError("RIR must be F or a non-negative whole number")
+        rir = str(int(rir))
+    changes.update(rir_code=rir, failure=rir == "F" if rir is not None else bool(data.failure))
+    if not data.skipped:
+        required = {
+            "external_weight": ("external_load", "reps"), "bodyweight": ("reps",),
+            "bodyweight_plus": ("external_load", "reps"), "assistance": ("assistance", "reps"),
+            "isometric": ("duration_seconds", "rounds"),
+            "resistance_units": ("resistance_value", "reps"), "amrap": ("reps",),
+            "custom": ("custom_result",),
+        }.get(data.measurement_type)
+        if required is None or any(getattr(data, field) in (None, "") for field in required):
+            raise ValueError("The entry needs all required performance values")
+        if data.measurement_type == "custom" and not str(data.custom_result).strip():
+            raise ValueError("The entry needs a non-blank result")
+        if require_rir and rir is None:
+            raise ValueError("Choose an RIR value for the corrected entry")
+    return replace(data, **changes)
 
 
 class ManagementMixin:
@@ -123,6 +160,7 @@ class ManagementMixin:
                 old["measurement_type"], old["unit"], _historical_resistance_unit(old),
             ):
                 raise ValueError("A correction must preserve the original measurement and units")
+            data = _validated_entry(data, require_rir=True)
             if data.bodyweight is not None and _nonnegative(data.bodyweight, "Bodyweight") != _nonnegative(
                 old["bodyweight"] if old["bodyweight"] is not None else session["bodyweight"], "Bodyweight",
             ):

@@ -38,6 +38,7 @@ class SummaryTests(unittest.TestCase):
             rendered = output.getvalue()
             self.assertIn('Removed Workout A', rendered)
             self.assertIn('2026-10-02', rendered)
+            self.assertNotIn('2026-10-01', rendered)
             self.assertIn('Performance check', rendered)
             self.assertIn('+2 technical', rendered)
             self.assertIn('0 → 2', rendered)

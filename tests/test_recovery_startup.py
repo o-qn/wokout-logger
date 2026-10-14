@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from workout_logger.backups import BackupManager
 from workout_logger.database import Database
-from workout_logger.main import app_paths, recover_startup_database
+from workout_logger.main import app_paths, recover_startup_database, RecoverySelectionError
 
 
 class StartupRecoveryTests(unittest.TestCase):
@@ -36,7 +36,8 @@ class StartupRecoveryTests(unittest.TestCase):
             for filename in ('../another.db', 'workouts.db', 'recovered-missing.db'):
                 pointer.write_text(json.dumps({'database': filename}))
                 with patch.dict('os.environ', {'WORKOUT_LOGGER_DATA_DIR': str(td)}):
-                    self.assertEqual(app_paths()[0], td / 'workouts.db')
+                    with self.assertRaises(RecoverySelectionError):
+                        app_paths()
 
 
 if __name__ == '__main__':

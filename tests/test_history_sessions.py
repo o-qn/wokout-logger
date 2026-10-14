@@ -168,7 +168,7 @@ class HistorySessionTests(unittest.TestCase):
         exercise = self.service.get_session_exercise(running, self.exercise_ids[0])
         self.assertEqual(exercise["resistance_unit"], "units")
         self.service.save_entry(running, self.data(
-            measurement_type="resistance_units", resistance_unit=exercise["resistance_unit"],
+            measurement_type="resistance_units", unit="units", resistance_unit=exercise["resistance_unit"],
             external_load=None, resistance_value=Decimal("2"),
         ))
         self.service.update_exercise(self.exercise_ids[0], default_unit="springs", resistance_unit=None)

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from collections import OrderedDict
+from decimal import Decimal, InvalidOperation
+import os
+import tempfile
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
@@ -14,10 +17,24 @@ from ..notation import format_entry
 def _duration_text(value):
     if value is None:
         return "Not recorded"
-    seconds = max(0, int(float(value)))
+    try:
+        duration = Decimal(str(value))
+        if not duration.is_finite() or duration < 0:
+            return "Not recorded"
+        seconds = int(duration)
+    except (InvalidOperation, TypeError, ValueError):
+        return "Not recorded"
     hours, rest = divmod(seconds, 3600)
     minutes, seconds = divmod(rest, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+class _ExportSnapshot:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def fetchall(self, sql, params=()):
+        return self.connection.execute(sql, params).fetchall()
 
 
 class ExcelExporter:
@@ -26,23 +43,43 @@ class ExcelExporter:
 
     def export(self, output_path: Path | str) -> Path:
         output = Path(output_path).expanduser()
+        protected = {self.db.path.resolve(), Path(str(self.db.path) + "-wal").resolve(), Path(str(self.db.path) + "-shm").resolve()}
+        if output.resolve() in protected:
+            raise ValueError("Excel export must use a different path from the workout database")
         output.parent.mkdir(parents=True, exist_ok=True)
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Workouts"
-        self._workouts_sheet(ws)
-        self._exercise_history_sheet(wb.create_sheet("Exercise History"))
-        self._bodyweight_sheet(wb.create_sheet("Bodyweight"))
-        self._raw_sheet(wb.create_sheet("Raw Data"))
+        # Every sheet must describe the same committed state, even if a second
+        # app instance saves a workout while the workbook is being assembled.
+        with self.db.connect() as connection:
+            connection.execute("BEGIN")
+            renderer = ExcelExporter(_ExportSnapshot(connection))
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Workouts"
+            renderer._workouts_sheet(ws)
+            renderer._exercise_history_sheet(wb.create_sheet("Exercise History"))
+            renderer._bodyweight_sheet(wb.create_sheet("Bodyweight"))
+            renderer._raw_sheet(wb.create_sheet("Raw Data"))
 
         for sheet in wb.worksheets:
-            sheet.freeze_panes = "B2" if sheet.title == "Workouts" else "A2"
+            # Workout metadata occupies five rows above the exercise results.
+            sheet.freeze_panes = "B6" if sheet.title == "Workouts" else "A2"
+            for row in sheet.iter_rows():
+                for cell in row:
+                    if isinstance(cell.value, str):
+                        # Names, notes and custom results are literal log text.
+                        cell.data_type = "s"
             self._autosize(sheet)
 
-        tmp = output.with_suffix(output.suffix + ".tmp")
-        wb.save(tmp)
-        tmp.replace(output)
+        descriptor, name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
+        os.close(descriptor)
+        tmp = Path(name)
+        try:
+            wb.save(tmp)
+            tmp.replace(output)
+        finally:
+            wb.close()
+            tmp.unlink(missing_ok=True)
         return output
 
     def _sessions(self):

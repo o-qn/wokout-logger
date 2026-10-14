@@ -44,7 +44,8 @@ class ComparisonSelectionTests(unittest.TestCase):
         with patch('workout_logger.main.console', Console(file=output, width=220, color_system=None)):
             session_summary(self.service, current)
         text = output.getvalue()
-        self.assertIn('2026-10-01', text)
+        self.assertIn('2026-10-03', text)
+        self.assertNotIn('2026-10-01', text)
         self.assertIn('10kg × 6 @0', text)
         self.assertIn('+1 rep', text)
         self.assertNotIn('20 @0', text)

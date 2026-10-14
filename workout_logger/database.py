@@ -10,6 +10,41 @@ from typing import Iterable, Optional, Any
 SCHEMA_VERSION = 3
 
 
+class UnsupportedSchemaError(sqlite3.DatabaseError):
+    """The database was written by a newer version of the application."""
+
+
+def check_schema_version(conn: sqlite3.Connection):
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'").fetchone():
+        return
+    row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+    if row is None:
+        return
+    try:
+        version = int(row[0])
+    except (TypeError, ValueError) as exc:
+        raise sqlite3.DatabaseError("The workout database has an invalid schema version") from exc
+    if version > SCHEMA_VERSION:
+        raise UnsupportedSchemaError(
+            f"This workout database needs a newer app (schema {version}; supported {SCHEMA_VERSION}). "
+            "Update the app to open it."
+        )
+
+
+def _execute_schema(conn: sqlite3.Connection, script: str):
+    # sqlite3.executescript() commits any pending transaction before running.
+    # Execute complete statements individually so all additive migrations,
+    # backfills, indexes and triggers commit or roll back together.
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        conn.execute(statement)
+
+
 class Database:
     def __init__(self, path: Path | str):
         self.path = Path(path).expanduser()
@@ -21,16 +56,23 @@ class Database:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
         try:
             yield conn
             conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
     def initialize(self):
         with self.connect() as conn:
-            conn.executescript(
+            # Check before changing journal mode or starting any migration.
+            check_schema_version(conn)
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("BEGIN IMMEDIATE")
+            check_schema_version(conn)
+            _execute_schema(conn,
                 """
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     key TEXT PRIMARY KEY,
@@ -142,12 +184,15 @@ class Database:
                 ("rest_alert_sound", "INTEGER NOT NULL DEFAULT 0"),
                 ("rest_alerted_for", "TEXT"),
                 ("template_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("template_config_revision", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     conn.execute(f"ALTER TABLE workout_sessions ADD COLUMN {name} {declaration}")
             template_columns = {r["name"] for r in conn.execute("PRAGMA table_info(workout_templates)")}
             if "revision" not in template_columns:
                 conn.execute("ALTER TABLE workout_templates ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+            if "config_revision" not in template_columns:
+                conn.execute("ALTER TABLE workout_templates ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0")
             entry_columns = {r["name"] for r in conn.execute("PRAGMA table_info(workout_entries)")}
             if "logged_at" not in entry_columns:
                 conn.execute("ALTER TABLE workout_entries ADD COLUMN logged_at TEXT")
@@ -248,7 +293,7 @@ class Database:
                     """,
                     (session["id"], session["id"]),
                 )
-            conn.executescript(
+            _execute_schema(conn,
                 """
                 CREATE TABLE IF NOT EXISTS app_settings (
                     key TEXT PRIMARY KEY, value TEXT NOT NULL

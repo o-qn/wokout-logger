@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
+from rich.markup import escape
 
 from ..notation import format_entry
 from ..services.management import _historical_resistance_unit
@@ -45,7 +47,7 @@ def _edit_template(service, template):
             try:
                 service.set_template_exercises(template["id"], draft)
             except ValueError as exc:
-                console.print(f"[red]{exc}[/red]")
+                console.print(f"[red]{escape(str(exc))}[/red]")
                 continue
             console.print("[green]Template saved. Changes apply when the next workout starts.[/green]")
             return
@@ -78,7 +80,7 @@ def _export_after_correction(exporter, export_path, correction=True):
         console.print("[green]Correction saved and Excel updated. Original values remain in revision history.[/green]" if correction
                       else "[green]Comparison baseline saved and Excel updated.[/green]")
     except Exception as exc:
-        console.print(f"[yellow]Changes are safely saved. Excel export failed: {exc}[/yellow]")
+        console.print(f"[yellow]Changes are safely saved. Excel export failed: {escape(str(exc))}[/yellow]")
 
 
 def saved_workout_menu(service, exporter, export_path, session_id, summary_callback):
@@ -115,7 +117,7 @@ def saved_workout_menu(service, exporter, export_path, session_id, summary_callb
             if changed:
                 _export_after_correction(exporter, export_path)
         except ValueError as exc:
-            console.print(f"[red]Correction not saved: {exc}[/red]")
+            console.print(f"[red]Correction not saved: {escape(str(exc))}[/red]")
 
 
 def _correct_entry(service, session_id):
@@ -141,10 +143,10 @@ def _correct_entry(service, session_id):
     if data is None:
         return False
     after = vars(data)
-    table = Table(title=f"Correction: {old['exercise_name_snapshot']}")
+    table = Table(title=Text(f"Correction: {old['exercise_name_snapshot']}"))
     table.add_column("Before")
     table.add_column("After")
-    table.add_row(format_entry(old), format_entry(after))
+    table.add_row(Text(format_entry(old)), Text(format_entry(after)))
     console.print(table)
     reason = text("Reason (optional):", "")
     if reason is None or not confirm("Save this correction and retain the original in revision history?", default=False):
@@ -210,7 +212,7 @@ def _show_revisions(service, session_id):
         table.add_column("Before")
         table.add_column("After")
         for field, before, after in sorted(_revision_changes(revision)):
-            table.add_row(field, _display_value(before), _display_value(after))
+            table.add_row(field, Text(_display_value(before)), Text(_display_value(after)))
         console.print(table)
         if revision["reason"]:
             console.print("Reason:", revision["reason"], markup=False)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 from typing import Mapping, Any, Optional
+from .measurements import measurement_unit
 
 
 def parse_decimal(value: str) -> Decimal:
@@ -112,7 +113,13 @@ def _number_key(value: Any) -> tuple:
 def _unit(row: Mapping[str, Any]) -> str:
     if row.get("measurement_type") == "resistance_units":
         return str(row.get("resistance_unit") or row.get("unit") or "units").strip()
-    return str(row.get("unit") or "kg").strip()
+    unit = str(row.get("unit") or "kg").strip()
+    if row.get("measurement_type") in {"external_weight", "bodyweight", "bodyweight_plus", "assistance"}:
+        try:
+            return measurement_unit(row["measurement_type"], requested=unit)
+        except ValueError:
+            pass
+    return unit
 
 
 def _rir(value: Any) -> tuple[Optional[Decimal], str]:
@@ -190,7 +197,7 @@ def comparison_message(current: Mapping[str, Any], previous: Optional[Mapping[st
         "assistance": ("bodyweight", "assistance"),
         "resistance_units": ("resistance_value",),
     }.get(mode, ())
-    if any(_number(row.get(field)) is None for row in (current, previous) for field in required):
+    if any(_number(row.get(field)) is None or _number(row.get(field)) < 0 for row in (current, previous) for field in required):
         return f"Loading unavailable; {_raw_rep_change(current, previous)}; performance comparison unavailable"
 
     cur_reps, prev_reps = _number(current.get("reps")), _number(previous.get("reps"))

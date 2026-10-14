@@ -39,7 +39,9 @@ def current_time(value: datetime | str | None = None) -> datetime:
 def timestamp_elapsed(value: Any, now: datetime) -> float | None:
     now = current_time(now)
     stamp = timestamp(value, now)
-    return max(0.0, (now - stamp).total_seconds()) if stamp else None
+    # Python treats two datetimes with the same ZoneInfo as wall times;
+    # normalize before subtraction so DST changes count real elapsed seconds.
+    return max(0.0, (now.astimezone(timezone.utc) - stamp.astimezone(timezone.utc)).total_seconds()) if stamp else None
 
 
 def seconds_value(value: Any) -> float:
@@ -51,9 +53,17 @@ def seconds_value(value: Any) -> float:
 
 
 def session_elapsed_from_record(session: Mapping[str, Any], now: datetime) -> float:
+    now = current_time(now)
     saved = session.get("workout_duration_seconds")
     if session.get("status") != "in_progress" and saved is not None:
         return seconds_value(saved)
+    if session.get("status") != "in_progress":
+        # Old workouts predate the saved-duration column. Their finish time is
+        # still authoritative; viewing history must never keep them running.
+        finished = timestamp(session.get("completed_at") or session.get("last_activity_at"), now)
+        if finished is None:
+            return 0.0
+        now = finished.astimezone(now.tzinfo)
     total = timestamp_elapsed(session.get("started_at"), now) or 0.0
     pauses = seconds_value(session.get("paused_seconds"))
     if session.get("paused_at"):
@@ -127,9 +137,10 @@ class TimingMixin:
         rest_start = timestamp(session.get("rest_started_at"), moment)
         if rest_start is None:
             return None
+        rest_start = rest_start.astimezone(timezone.utc)
         # A finished session's rest counter is only used for saved timing views.
         end = timestamp(session.get("completed_at"), moment) if session.get("status") != "in_progress" else moment
-        end = end or moment
+        end = (end or moment).astimezone(timezone.utc)
         elapsed = max(0.0, (end - rest_start).total_seconds())
         for interval in self.db.fetchall(
             "SELECT paused_at,resumed_at FROM workout_pause_intervals WHERE session_id=?", (session_id,),
@@ -137,6 +148,8 @@ class TimingMixin:
             start = timestamp(interval["paused_at"], moment)
             finish = timestamp(interval["resumed_at"], moment) if interval["resumed_at"] else end
             if start is not None and finish is not None:
+                start = start.astimezone(timezone.utc)
+                finish = finish.astimezone(timezone.utc)
                 elapsed -= max(0.0, (min(end, finish) - max(rest_start, start)).total_seconds())
         return max(0.0, elapsed)
 
