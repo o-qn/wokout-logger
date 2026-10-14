@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional, Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 
 class Database:
@@ -127,6 +128,156 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_sessions_status ON workout_sessions(status);
                 """
             )
+            # Additive migrations keep every existing session, entry and weigh-in.
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(workout_sessions)")}
+            for name, declaration in (
+                ("template_label_snapshot", "TEXT"),
+                ("rest_started_at", "TEXT"),
+                ("exercise_snapshot_initialized", "INTEGER NOT NULL DEFAULT 0"),
+                ("comparison_mode", "TEXT NOT NULL DEFAULT 'previous'"),
+                ("paused_at", "TEXT"),
+                ("paused_seconds", "TEXT NOT NULL DEFAULT '0'"),
+                ("workout_duration_seconds", "TEXT"),
+                ("rest_target_seconds", "INTEGER"),
+                ("rest_alert_sound", "INTEGER NOT NULL DEFAULT 0"),
+                ("rest_alerted_for", "TEXT"),
+                ("template_revision", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE workout_sessions ADD COLUMN {name} {declaration}")
+            template_columns = {r["name"] for r in conn.execute("PRAGMA table_info(workout_templates)")}
+            if "revision" not in template_columns:
+                conn.execute("ALTER TABLE workout_templates ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+            entry_columns = {r["name"] for r in conn.execute("PRAGMA table_info(workout_entries)")}
+            if "logged_at" not in entry_columns:
+                conn.execute("ALTER TABLE workout_entries ADD COLUMN logged_at TEXT")
+                conn.execute("UPDATE workout_entries SET logged_at=created_at WHERE skipped=0")
+            if "rest_alerted" not in entry_columns:
+                conn.execute("ALTER TABLE workout_entries ADD COLUMN rest_alerted INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workout_session_exercises (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL REFERENCES workout_sessions(id) ON DELETE CASCADE,
+                    exercise_id INTEGER NOT NULL REFERENCES exercises(id),
+                    exercise_name_snapshot TEXT NOT NULL,
+                    exercise_order INTEGER NOT NULL,
+                    measurement_type_snapshot TEXT NOT NULL,
+                    unit_snapshot TEXT NOT NULL,
+                    resistance_unit_snapshot TEXT,
+                    default_external_load TEXT,
+                    default_assistance TEXT,
+                    default_duration_seconds TEXT,
+                    default_rounds INTEGER,
+                    default_rest_seconds TEXT,
+                    default_resistance_value TEXT,
+                    UNIQUE(session_id, exercise_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                UPDATE workout_sessions SET template_label_snapshot=(
+                    SELECT label FROM workout_templates WHERE id=workout_sessions.template_id
+                ) WHERE template_label_snapshot IS NULL
+                """
+            )
+            # Freeze legacy sessions once. A logged row is the strongest source
+            # for its historical name, units and measurement behavior.
+            for session in conn.execute(
+                "SELECT * FROM workout_sessions WHERE exercise_snapshot_initialized=0"
+            ).fetchall():
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO workout_session_exercises(
+                        session_id, exercise_id, exercise_name_snapshot, exercise_order,
+                        measurement_type_snapshot, unit_snapshot, resistance_unit_snapshot,
+                        default_external_load, default_assistance, default_duration_seconds,
+                        default_rounds, default_rest_seconds, default_resistance_value
+                    )
+                    SELECT ?, te.exercise_id, e.name, te.exercise_order,
+                           te.measurement_type_snapshot, te.unit_snapshot, te.resistance_unit_snapshot,
+                           te.default_external_load, te.default_assistance, te.default_duration_seconds,
+                           te.default_rounds, te.default_rest_seconds, te.default_resistance_value
+                    FROM workout_template_exercises te JOIN exercises e ON e.id=te.exercise_id
+                    WHERE te.template_id=?
+                    """,
+                    (session["id"], session["template_id"]),
+                )
+                if session["created_new_template"] and session["status"] == "in_progress":
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO workout_session_exercises(
+                            session_id, exercise_id, exercise_name_snapshot, exercise_order,
+                            measurement_type_snapshot, unit_snapshot, resistance_unit_snapshot
+                        ) SELECT ?, id, name, display_order, measurement_type, default_unit,
+                                 resistance_unit FROM exercises WHERE archived=0
+                        """,
+                        (session["id"],),
+                    )
+                for entry in conn.execute(
+                    "SELECT * FROM workout_entries WHERE session_id=?", (session["id"],)
+                ).fetchall():
+                    conn.execute(
+                        """
+                        INSERT INTO workout_session_exercises(
+                            session_id, exercise_id, exercise_name_snapshot, exercise_order,
+                            measurement_type_snapshot, unit_snapshot, resistance_unit_snapshot,
+                            default_external_load, default_assistance, default_duration_seconds,
+                            default_rounds, default_rest_seconds, default_resistance_value
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(session_id, exercise_id) DO UPDATE SET
+                            exercise_name_snapshot=excluded.exercise_name_snapshot,
+                            measurement_type_snapshot=excluded.measurement_type_snapshot,
+                            unit_snapshot=excluded.unit_snapshot,
+                            resistance_unit_snapshot=excluded.resistance_unit_snapshot
+                        """,
+                        (session["id"], entry["exercise_id"], entry["exercise_name_snapshot"],
+                         entry["exercise_order"], entry["measurement_type"], entry["unit"],
+                         entry["resistance_unit"], entry["external_load"], entry["assistance"],
+                         entry["duration_seconds"], entry["rounds"], entry["rest_seconds"],
+                         entry["resistance_value"]),
+                    )
+                conn.execute(
+                    """
+                    UPDATE workout_sessions SET exercise_snapshot_initialized=1,
+                        rest_started_at=COALESCE(rest_started_at, (
+                            SELECT created_at FROM workout_entries
+                            WHERE session_id=? AND skipped=0 ORDER BY id DESC LIMIT 1
+                        )) WHERE id=?
+                    """,
+                    (session["id"], session["id"]),
+                )
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS workout_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL REFERENCES workout_sessions(id),
+                    entry_id INTEGER REFERENCES workout_entries(id),
+                    change_type TEXT NOT NULL,
+                    before_json TEXT NOT NULL,
+                    after_json TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_revisions_session ON workout_revisions(session_id,id);
+                CREATE TRIGGER IF NOT EXISTS immutable_revision_update BEFORE UPDATE ON workout_revisions
+                BEGIN SELECT RAISE(ABORT,'Workout revision history is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS immutable_revision_delete BEFORE DELETE ON workout_revisions
+                BEGIN SELECT RAISE(ABORT,'Workout revision history is immutable'); END;
+                CREATE TABLE IF NOT EXISTS workout_pause_intervals (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER NOT NULL REFERENCES workout_sessions(id),
+                    paused_at TEXT NOT NULL,
+                    resumed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_pauses_session ON workout_pause_intervals(session_id);
+                """
+            )
+            conn.execute("INSERT OR IGNORE INTO app_settings(key,value) VALUES('database_uuid',?)", (str(uuid.uuid4()),))
             conn.execute(
                 "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

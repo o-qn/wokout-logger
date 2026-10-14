@@ -6,6 +6,10 @@ from typing import Optional, Iterable
 
 from ..database import Database
 from ..models import WorkoutEntryData
+from ..backups import BackupManager, BackupError
+from .management import ManagementMixin
+from .timing import TimingMixin
+from .comparison import ComparisonMixin
 
 
 def _label_from_index(index: int) -> str:
@@ -18,9 +22,41 @@ def _label_from_index(index: int) -> str:
     return result
 
 
-class WorkoutService:
+def _resistance_unit(mode: str, unit: str | None, resistance_unit: str | None):
+    if mode != "resistance_units" or resistance_unit:
+        return resistance_unit
+    candidate = (unit or "").strip()
+    return candidate if candidate.lower() not in {"", "kg", "lb", "lbs", "sec", "seconds", "reps"} else "units"
+
+
+class WorkoutService(ManagementMixin, TimingMixin, ComparisonMixin):
     def __init__(self, db: Database):
         self.db = db
+        self.backups = BackupManager(db)
+        self.backup_warning = None
+        with self.db.connect() as conn:
+            for exercise in conn.execute(
+                "SELECT * FROM exercises WHERE measurement_type='resistance_units' AND resistance_unit IS NULL"
+            ).fetchall():
+                conn.execute(
+                    "UPDATE exercises SET resistance_unit=? WHERE id=?",
+                    (_resistance_unit(exercise["measurement_type"], exercise["default_unit"], None), exercise["id"]),
+                )
+            self._relabel_templates_conn(conn)
+
+    def _backup_before_change(self, reason: str):
+        return self.backups.create_backup(reason)
+
+    def get_setting(self, key: str, default=None):
+        row = self.db.fetchone("SELECT value FROM app_settings WHERE key=?", (key,))
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value):
+        self.db.execute("INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+    def _template_unchanged(self, conn, session):
+        row = conn.execute("SELECT revision FROM workout_templates WHERE id=?", (session["template_id"],)).fetchone()
+        return row is not None and row["revision"] == session["template_revision"]
 
     # ---------- exercises ----------
     def active_exercises(self):
@@ -41,7 +77,8 @@ class WorkoutService:
         row = self.db.fetchone("SELECT COALESCE(MAX(display_order),0)+1 AS n FROM exercises")
         return self.db.execute(
             "INSERT INTO exercises(name, measurement_type, default_unit, resistance_unit, display_order) VALUES(?,?,?,?,?)",
-            (name.strip(), measurement_type, default_unit.strip() or "kg", resistance_unit, row["n"]),
+            (name.strip(), measurement_type, default_unit.strip() or "kg",
+             _resistance_unit(measurement_type, default_unit, resistance_unit), row["n"]),
         )
 
     def update_exercise(self, exercise_id: int, **changes):
@@ -49,10 +86,19 @@ class WorkoutService:
         pairs = [(k, v) for k, v in changes.items() if k in allowed]
         if not pairs:
             return
+        self._backup_before_change("exercise-settings")
         sql = ", ".join(f"{k}=?" for k, _ in pairs) + ", updated_at=CURRENT_TIMESTAMP"
         values = [int(v) if k == "archived" else v for k, v in pairs]
         values.append(exercise_id)
-        self.db.execute(f"UPDATE exercises SET {sql} WHERE id=?", values)
+        with self.db.connect() as conn:
+            conn.execute(f"UPDATE exercises SET {sql} WHERE id=?", values)
+            exercise = conn.execute("SELECT * FROM exercises WHERE id=?", (exercise_id,)).fetchone()
+            if exercise and exercise["measurement_type"] == "resistance_units" and not exercise["resistance_unit"]:
+                conn.execute(
+                    "UPDATE exercises SET resistance_unit=? WHERE id=?",
+                    (_resistance_unit(exercise["measurement_type"], exercise["default_unit"], None), exercise_id),
+                )
+            self._sync_template_config_conn(conn, exercise_id=exercise_id)
 
     # ---------- templates ----------
     def templates(self):
@@ -69,18 +115,80 @@ class WorkoutService:
         return [dict(r) for r in rows]
 
     def next_template_label(self) -> str:
-        rows = self.db.fetchall("SELECT label FROM workout_templates")
-        labels = {r["label"] for r in rows}
-        idx = 1
-        while _label_from_index(idx) in labels:
-            idx += 1
-        return _label_from_index(idx)
+        row = self.db.fetchone("SELECT COUNT(*) AS n FROM workout_templates WHERE active=1")
+        return _label_from_index(row["n"] + 1)
 
     def create_template(self) -> int:
-        label = self.next_template_label()
-        return self.db.execute("INSERT INTO workout_templates(label) VALUES(?)", (label,))
+        with self.db.connect() as conn:
+            self._relabel_templates_conn(conn)
+            count = conn.execute("SELECT COUNT(*) FROM workout_templates WHERE active=1").fetchone()[0]
+            return int(conn.execute(
+                "INSERT INTO workout_templates(label) VALUES(?)", (_label_from_index(count + 1),)
+            ).lastrowid)
+
+    def _relabel_templates_conn(self, conn):
+        # The unique label belongs to the current menu; history owns a separate
+        # immutable label. Temporary labels prevent A/B swaps from colliding.
+        rows = conn.execute("SELECT id, active FROM workout_templates ORDER BY id").fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE workout_templates SET label=? WHERE id=?",
+                (f"__template_{row['id']}__", row["id"]),
+            )
+        active_index = 0
+        for row in rows:
+            if row["active"]:
+                active_index += 1
+                label = _label_from_index(active_index)
+            else:
+                label = f"__removed_{row['id']}__"
+            conn.execute("UPDATE workout_templates SET label=? WHERE id=?", (label, row["id"]))
+
+    def remove_template(self, template_id: int):
+        self._backup_before_change("remove-template")
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT id FROM workout_templates WHERE id=?", (template_id,)).fetchone()
+            if not row:
+                raise ValueError("Workout template not found")
+            conn.execute("UPDATE workout_templates SET active=0 WHERE id=?", (template_id,))
+            self._relabel_templates_conn(conn)
+
+    def _sync_template_config_conn(self, conn, template_id=None, exercise_id=None):
+        filters, params = [], []
+        if template_id is not None:
+            filters.append("te.template_id=?")
+            params.append(template_id)
+        if exercise_id is not None:
+            filters.append("te.exercise_id=?")
+            params.append(exercise_id)
+        where = " AND ".join(filters) or "1=1"
+        rows = conn.execute(
+            f"""
+            SELECT te.*, e.measurement_type, e.default_unit, e.resistance_unit
+            FROM workout_template_exercises te JOIN exercises e ON e.id=te.exercise_id
+            WHERE {where}
+            """, params,
+        ).fetchall()
+        for row in rows:
+            if (row["measurement_type_snapshot"], row["unit_snapshot"], row["resistance_unit_snapshot"]) == (
+                row["measurement_type"], row["default_unit"], row["resistance_unit"]
+            ):
+                continue
+            # Never reuse a numeric default under a different measurement or
+            # unit. Entries and already-started sessions retain their snapshots.
+            conn.execute(
+                """
+                UPDATE workout_template_exercises SET measurement_type_snapshot=?, unit_snapshot=?,
+                    resistance_unit_snapshot=?, default_external_load=NULL, default_assistance=NULL,
+                    default_duration_seconds=NULL, default_rounds=NULL, default_rest_seconds=NULL,
+                    default_resistance_value=NULL WHERE id=?
+                """,
+                (row["measurement_type"], row["default_unit"], row["resistance_unit"], row["id"]),
+            )
 
     def template_exercises(self, template_id: int):
+        with self.db.connect() as conn:
+            self._sync_template_config_conn(conn, template_id=template_id)
         rows = self.db.fetchall(
             """
             SELECT te.*, e.name AS current_name, e.archived
@@ -96,42 +204,118 @@ class WorkoutService:
     # ---------- sessions ----------
     def start_new_template_session(self, session_date: str, bodyweight: str) -> int:
         template_id = self.create_template()
-        planned_total = len(self.active_exercises())
-        session_id = self.db.execute(
-            """
-            INSERT INTO workout_sessions(template_id, session_date, bodyweight, created_new_template, planned_total)
-            VALUES(?,?,?,?,?)
-            """,
-            (template_id, session_date, bodyweight, 1, planned_total),
-        )
-        self.db.execute(
-            "INSERT INTO bodyweight_entries(session_id, entry_date, bodyweight) VALUES(?,?,?)",
-            (session_id, session_date, bodyweight),
-        )
-        return session_id
+        return self._start_session(template_id, session_date, bodyweight, created_new_template=True)
 
     def start_existing_template_session(self, template_id: int, session_date: str, bodyweight: str) -> int:
-        count = self.db.fetchone(
-            "SELECT COUNT(*) AS n FROM workout_template_exercises WHERE template_id=?",
-            (template_id,),
-        )["n"]
-        session_id = self.db.execute(
-            """
-            INSERT INTO workout_sessions(template_id, session_date, bodyweight, created_new_template, planned_total)
-            VALUES(?,?,?,?,?)
-            """,
-            (template_id, session_date, bodyweight, 0, count),
-        )
-        self.db.execute(
-            "INSERT INTO bodyweight_entries(session_id, entry_date, bodyweight) VALUES(?,?,?)",
-            (session_id, session_date, bodyweight),
-        )
+        return self._start_session(template_id, session_date, bodyweight, created_new_template=False)
+
+    def _start_session(self, template_id: int, session_date: str, bodyweight: str, created_new_template: bool):
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self.db.connect() as conn:
+            template = conn.execute(
+                "SELECT * FROM workout_templates WHERE id=? AND active=1", (template_id,)
+            ).fetchone()
+            if not template:
+                raise ValueError("Workout template has been removed")
+            self._sync_template_config_conn(conn, template_id=template_id)
+            if created_new_template:
+                exercise_rows = conn.execute(
+                    "SELECT * FROM exercises WHERE archived=0 ORDER BY display_order, id"
+                ).fetchall()
+            else:
+                exercise_rows = conn.execute(
+                    """
+                    SELECT te.*, e.name FROM workout_template_exercises te
+                    JOIN exercises e ON e.id=te.exercise_id
+                    WHERE te.template_id=? ORDER BY te.exercise_order
+                    """, (template_id,),
+                ).fetchall()
+            session_id = int(conn.execute(
+                """
+                INSERT INTO workout_sessions(
+                    template_id, session_date, bodyweight, created_new_template, planned_total,
+                    template_label_snapshot, exercise_snapshot_initialized, started_at, last_activity_at
+                ) VALUES(?,?,?,?,?,?,1,?,?)
+                """,
+                (template_id, session_date, bodyweight, int(created_new_template), len(exercise_rows),
+                 template["label"], now, now),
+            ).lastrowid)
+            reminder = self.get_rest_reminder_settings()
+            conn.execute(
+                "UPDATE workout_sessions SET comparison_mode=?, rest_target_seconds=?, rest_alert_sound=?, template_revision=? WHERE id=?",
+                (self.get_setting("comparison_mode", "previous"), reminder["target_seconds"], int(reminder["sound"]), template["revision"], session_id),
+            )
+            for index, source in enumerate(exercise_rows, start=1):
+                row = dict(source)
+                if created_new_template:
+                    exercise_id = row["id"]
+                    mode, unit, resistance_unit = row["measurement_type"], row["default_unit"], row["resistance_unit"]
+                    previous = conn.execute(
+                        """
+                        SELECT we.* FROM workout_entries we
+                        JOIN workout_sessions ws ON ws.id=we.session_id
+                        WHERE we.exercise_id=? AND we.skipped=0 AND ws.status<>'discarded'
+                          AND (ws.session_date<? OR (ws.session_date=? AND ws.id<?))
+                        ORDER BY ws.session_date DESC, ws.id DESC, we.id DESC LIMIT 1
+                        """, (exercise_id, session_date, session_date, session_id),
+                    ).fetchone()
+                    if previous and (previous["measurement_type"], previous["unit"], previous["resistance_unit"]) == (
+                        mode, unit, resistance_unit
+                    ):
+                        for field in ("external_load", "assistance", "duration_seconds", "rounds", "rest_seconds", "resistance_value"):
+                            row[f"default_{field}"] = previous[field]
+                else:
+                    exercise_id = row["exercise_id"]
+                    mode, unit, resistance_unit = row["measurement_type_snapshot"], row["unit_snapshot"], row["resistance_unit_snapshot"]
+                conn.execute(
+                    """
+                    INSERT INTO workout_session_exercises(
+                        session_id, exercise_id, exercise_name_snapshot, exercise_order,
+                        measurement_type_snapshot, unit_snapshot, resistance_unit_snapshot,
+                        default_external_load, default_assistance, default_duration_seconds,
+                        default_rounds, default_rest_seconds, default_resistance_value
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (session_id, exercise_id, row["name"], index, mode, unit, resistance_unit,
+                     row.get("default_external_load"), row.get("default_assistance"),
+                     row.get("default_duration_seconds"), row.get("default_rounds"),
+                     row.get("default_rest_seconds"), row.get("default_resistance_value")),
+                )
+            conn.execute(
+                "INSERT INTO bodyweight_entries(session_id, entry_date, bodyweight) VALUES(?,?,?)",
+                (session_id, session_date, bodyweight),
+            )
         return session_id
+
+    def session_exercises(self, session_id: int):
+        rows = self.db.fetchall(
+            "SELECT * FROM workout_session_exercises WHERE session_id=? ORDER BY exercise_order, id",
+            (session_id,),
+        )
+        exercises = []
+        for source in rows:
+            row = dict(source)
+            row["resistance_unit_snapshot"] = _resistance_unit(
+                row["measurement_type_snapshot"], row["unit_snapshot"], row["resistance_unit_snapshot"]
+            )
+            row.update(
+                id=row["exercise_id"], name=row["exercise_name_snapshot"],
+                current_name=row["exercise_name_snapshot"], measurement_type=row["measurement_type_snapshot"],
+                default_unit=row["unit_snapshot"], resistance_unit=row["resistance_unit_snapshot"],
+            )
+            exercises.append(row)
+        return exercises
+
+    def get_session_exercise(self, session_id: int, exercise_id: int):
+        return next((e for e in self.session_exercises(session_id) if e["exercise_id"] == exercise_id), None)
 
     def get_session(self, session_id: int):
         row = self.db.fetchone(
             """
-            SELECT s.*, t.label AS template_label
+            SELECT s.*, COALESCE(s.template_label_snapshot, t.label) AS template_label,
+                   CASE WHEN t.active=0 THEN 1 ELSE 0 END AS template_removed,
+                   CASE WHEN t.active=0 THEN 'Removed Workout ' ELSE 'Workout ' END ||
+                       COALESCE(s.template_label_snapshot, t.label, '?') AS workout_name
             FROM workout_sessions s
             LEFT JOIN workout_templates t ON t.id=s.template_id
             WHERE s.id=?
@@ -143,7 +327,10 @@ class WorkoutService:
     def unfinished_sessions(self):
         rows = self.db.fetchall(
             """
-            SELECT s.*, t.label AS template_label
+            SELECT s.*, COALESCE(s.template_label_snapshot, t.label) AS template_label,
+                   CASE WHEN t.active=0 THEN 1 ELSE 0 END AS template_removed,
+                   CASE WHEN t.active=0 THEN 'Removed Workout ' ELSE 'Workout ' END ||
+                       COALESCE(s.template_label_snapshot, t.label, '?') AS workout_name
             FROM workout_sessions s
             LEFT JOIN workout_templates t ON t.id=s.template_id
             WHERE s.status='in_progress'
@@ -166,8 +353,11 @@ class WorkoutService:
         params: list[object] = [exercise_id]
         extra = ""
         if exclude_session_id is not None:
-            extra = " AND we.session_id<>?"
-            params.append(exclude_session_id)
+            reference = self.get_session(exclude_session_id)
+            if not reference:
+                return None
+            extra = " AND (ws.session_date<? OR (ws.session_date=? AND ws.id<?))"
+            params.extend([reference["session_date"], reference["session_date"], exclude_session_id])
         row = self.db.fetchone(
             f"""
             SELECT we.*, ws.session_date
@@ -199,18 +389,26 @@ class WorkoutService:
         session = self.get_session(session_id)
         if not session or session["status"] != "in_progress":
             raise ValueError("Session is not active")
+        if session["paused_at"]:
+            raise ValueError("Resume the workout before logging a set")
+        frozen = self.get_session_exercise(session_id, data.exercise_id)
+        if not frozen:
+            raise ValueError("Exercise is not part of this session")
+        if (data.measurement_type, data.unit, data.resistance_unit) != (
+            frozen["measurement_type"], frozen["default_unit"], frozen["resistance_unit"]
+        ):
+            raise ValueError("Exercise settings differ from the settings at the start of this session")
 
         if session["created_new_template"]:
             order = self._next_entry_order(session_id)
         else:
-            order = self._template_order_for_exercise(session["template_id"], data.exercise_id)
-            if order is None:
-                raise ValueError("Exercise is not part of this template")
+            order = frozen["exercise_order"]
 
+        now = self._timing_now().isoformat(timespec="microseconds")
         values = (
             session_id,
             data.exercise_id,
-            data.exercise_name,
+            frozen["name"],
             data.measurement_type,
             data.unit,
             str(data.bodyweight) if data.bodyweight is not None else session["bodyweight"],
@@ -228,6 +426,7 @@ class WorkoutService:
             data.notes,
             order,
             int(data.skipped),
+            now if not data.skipped else None,
         )
         with self.db.connect() as conn:
             cur = conn.execute(
@@ -236,13 +435,13 @@ class WorkoutService:
                     session_id, exercise_id, exercise_name_snapshot, measurement_type, unit, bodyweight,
                     external_load, assistance, reps, duration_seconds, rounds, rest_seconds,
                     resistance_value, resistance_unit, custom_result, rir_code, failure, notes,
-                    exercise_order, skipped
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    exercise_order, skipped, logged_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 values,
             )
             entry_id = int(cur.lastrowid)
-            if session["created_new_template"]:
+            if session["created_new_template"] and self._template_unchanged(conn, session):
                 conn.execute(
                     """
                     INSERT INTO workout_template_exercises(
@@ -260,11 +459,15 @@ class WorkoutService:
                         str(data.resistance_value) if data.resistance_value is not None else None,
                     ),
                 )
-            elif not data.skipped:
+                self._sync_template_config_conn(conn, template_id=session["template_id"])
+            elif not data.skipped and self._template_unchanged(conn, session):
                 self._update_template_defaults_conn(conn, session["template_id"], data)
             conn.execute(
-                "UPDATE workout_sessions SET last_activity_at=? WHERE id=?",
-                (datetime.now().isoformat(timespec="seconds"), session_id),
+                """
+                UPDATE workout_sessions SET last_activity_at=?,
+                    rest_started_at=CASE WHEN ?=0 THEN ? ELSE rest_started_at END WHERE id=?
+                """,
+                (now, int(data.skipped), now, session_id),
             )
         return entry_id
 
@@ -274,7 +477,8 @@ class WorkoutService:
             UPDATE workout_template_exercises SET
                 default_external_load=?, default_assistance=?, default_duration_seconds=?, default_rounds=?,
                 default_rest_seconds=?, default_resistance_value=?, resistance_unit_snapshot=?
-            WHERE template_id=? AND exercise_id=?
+            WHERE template_id=? AND exercise_id=? AND measurement_type_snapshot=? AND unit_snapshot=?
+                AND resistance_unit_snapshot IS ?
             """,
             (
                 str(data.external_load) if data.external_load is not None else None,
@@ -286,6 +490,9 @@ class WorkoutService:
                 data.resistance_unit,
                 template_id,
                 data.exercise_id,
+                data.measurement_type,
+                data.unit,
+                data.resistance_unit,
             ),
         )
 
@@ -293,7 +500,18 @@ class WorkoutService:
         old = self.get_entry(entry_id)
         if not old:
             raise ValueError("Entry not found")
+        if (data.measurement_type, data.unit, data.resistance_unit) != (
+            old["measurement_type"], old["unit"],
+            _resistance_unit(old["measurement_type"], old["unit"], old["resistance_unit"])
+        ):
+            raise ValueError("Editing an entry must preserve its original measurement and units")
         session = self.get_session(old["session_id"])
+        if session["status"] in {"complete", "incomplete"}:
+            return self.correct_entry(entry_id, data)
+        if session["status"] != "in_progress" or session["paused_at"]:
+            raise ValueError("Only an active, unpaused workout can be edited here")
+        now = self._timing_now().isoformat(timespec="microseconds")
+        newly_logged = old["skipped"] and not data.skipped
         with self.db.connect() as conn:
             conn.execute(
                 """
@@ -301,11 +519,11 @@ class WorkoutService:
                     exercise_name_snapshot=?, measurement_type=?, unit=?, bodyweight=?, external_load=?,
                     assistance=?, reps=?, duration_seconds=?, rounds=?, rest_seconds=?, resistance_value=?,
                     resistance_unit=?, custom_result=?, rir_code=?, failure=?, notes=?, skipped=?,
-                    updated_at=CURRENT_TIMESTAMP
+                    logged_at=CASE WHEN ? THEN ? ELSE logged_at END, updated_at=CURRENT_TIMESTAMP
                 WHERE id=?
                 """,
                 (
-                    data.exercise_name, data.measurement_type, data.unit,
+                    old["exercise_name_snapshot"], old["measurement_type"], old["unit"],
                     str(data.bodyweight) if data.bodyweight is not None else session["bodyweight"],
                     str(data.external_load) if data.external_load is not None else None,
                     str(data.assistance) if data.assistance is not None else None,
@@ -314,24 +532,30 @@ class WorkoutService:
                     data.rounds,
                     str(data.rest_seconds) if data.rest_seconds is not None else None,
                     str(data.resistance_value) if data.resistance_value is not None else None,
-                    data.resistance_unit,
+                    old["resistance_unit"],
                     data.custom_result,
                     data.rir_code.upper() if data.rir_code else None,
                     int(data.failure),
                     data.notes,
                     int(data.skipped),
+                    int(newly_logged), now,
                     entry_id,
                 ),
             )
-            if not data.skipped and session and session["template_id"]:
+            if not data.skipped and session and session["template_id"] and session["status"] == "in_progress" and self._template_unchanged(conn, session):
                 self._update_template_defaults_conn(conn, session["template_id"], data)
             conn.execute(
-                "UPDATE workout_sessions SET last_activity_at=? WHERE id=?",
-                (datetime.now().isoformat(timespec="seconds"), old["session_id"]),
+                """
+                UPDATE workout_sessions SET last_activity_at=?,
+                    rest_started_at=CASE WHEN ? THEN ? ELSE rest_started_at END WHERE id=?
+                """,
+                (now, int(newly_logged), now, old["session_id"]),
             )
 
     def undo_last_entry(self, session_id: int) -> Optional[dict]:
         session = self.get_session(session_id)
+        if not session or session["status"] != "in_progress":
+            raise ValueError("Only an active session can be undone")
         row = self.db.fetchone(
             "SELECT * FROM workout_entries WHERE session_id=? ORDER BY exercise_order DESC, id DESC LIMIT 1",
             (session_id,),
@@ -341,21 +565,29 @@ class WorkoutService:
         entry = dict(row)
         with self.db.connect() as conn:
             conn.execute("DELETE FROM workout_entries WHERE id=?", (entry["id"],))
-            if session and session["created_new_template"]:
+            if session and session["created_new_template"] and self._template_unchanged(conn, session):
                 conn.execute(
                     "DELETE FROM workout_template_exercises WHERE template_id=? AND exercise_id=?",
                     (session["template_id"], entry["exercise_id"]),
                 )
-            conn.execute("UPDATE workout_sessions SET last_activity_at=? WHERE id=?", (datetime.now().isoformat(timespec="seconds"), session_id))
+            remaining_set = conn.execute(
+                "SELECT COALESCE(logged_at,created_at) AS logged_at,rest_alerted FROM workout_entries WHERE session_id=? AND skipped=0 ORDER BY julianday(COALESCE(logged_at,created_at)) DESC,id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            rest = remaining_set["logged_at"] if remaining_set else None
+            alerted = rest if remaining_set and remaining_set["rest_alerted"] else None
+            conn.execute(
+                "UPDATE workout_sessions SET last_activity_at=?,rest_started_at=?,rest_alerted_for=? WHERE id=?",
+                (self._timing_now().isoformat(timespec="microseconds"), rest, alerted, session_id),
+            )
         return entry
 
     def remaining_for_session(self, session_id: int):
         session = self.get_session(session_id)
+        if not session:
+            return []
         done_ids = {r["exercise_id"] for r in self.session_entries(session_id)}
-        if session["created_new_template"]:
-            return [e for e in self.active_exercises() if e["id"] not in done_ids]
-        template_rows = self.template_exercises(session["template_id"])
-        return [r for r in template_rows if r["exercise_id"] not in done_ids]
+        return [e for e in self.session_exercises(session_id) if e["exercise_id"] not in done_ids]
 
     def finalize_session(self, session_id: int, force_incomplete: bool = False):
         session = self.get_session(session_id)
@@ -363,12 +595,12 @@ class WorkoutService:
             return
         entries = self.session_entries(session_id)
         completed = sum(1 for e in entries if not e["skipped"])
-        visited = len(entries)
         remaining = len(self.remaining_for_session(session_id))
         incomplete = force_incomplete or remaining > 0 or completed < session["planned_total"]
         status = "incomplete" if incomplete else "complete"
         now = datetime.now().isoformat(timespec="seconds")
         with self.db.connect() as conn:
+            self._finish_session_timing_conn(conn, session_id)
             conn.execute(
                 "UPDATE workout_sessions SET status=?, completed_at=?, last_activity_at=? WHERE id=?",
                 (status, now, now, session_id),
@@ -381,11 +613,19 @@ class WorkoutService:
                 ).fetchone()[0]
                 if template_count == 0:
                     conn.execute("UPDATE workout_templates SET active=0 WHERE id=?", (session["template_id"],))
+                    self._relabel_templates_conn(conn)
                 else:
                     conn.execute(
-                        "UPDATE workout_templates SET last_used_at=?, active=1 WHERE id=?",
+                        "UPDATE workout_templates SET last_used_at=? WHERE id=?",
                         (now, session["template_id"]),
                     )
+        try:
+            self.backups.create_backup("after-workout")
+            self.backup_warning = None
+        except (BackupError, OSError) as exc:
+            # The workout has already committed; a failed copy must not turn a
+            # successful save into a failed or duplicate workout.
+            self.backup_warning = str(exc)
         return status
 
     def save_unfinished_as_incomplete(self, session_id: int):
@@ -395,21 +635,30 @@ class WorkoutService:
         session = self.get_session(session_id)
         if not session:
             return
+        if session["status"] != "in_progress":
+            raise ValueError("Only an unfinished workout can be discarded")
         with self.db.connect() as conn:
-            conn.execute("DELETE FROM workout_sessions WHERE id=?", (session_id,))
+            conn.execute(
+                "UPDATE workout_sessions SET status='discarded', last_activity_at=? WHERE id=?",
+                (datetime.now().astimezone().isoformat(timespec="seconds"), session_id),
+            )
             if session["created_new_template"] and session["template_id"]:
                 uses = conn.execute(
-                    "SELECT COUNT(*) FROM workout_sessions WHERE template_id=?",
+                    "SELECT COUNT(*) FROM workout_sessions WHERE template_id=? AND status<>'discarded'",
                     (session["template_id"],),
                 ).fetchone()[0]
                 if uses == 0:
-                    conn.execute("DELETE FROM workout_templates WHERE id=?", (session["template_id"],))
+                    conn.execute("UPDATE workout_templates SET active=0 WHERE id=?", (session["template_id"],))
+                    self._relabel_templates_conn(conn)
 
     # ---------- history ----------
     def workout_history(self, limit: int = 100):
         rows = self.db.fetchall(
             """
-            SELECT s.*, t.label AS template_label,
+            SELECT s.*, COALESCE(s.template_label_snapshot, t.label) AS template_label,
+                   CASE WHEN t.active=0 THEN 1 ELSE 0 END AS template_removed,
+                   CASE WHEN t.active=0 THEN 'Removed Workout ' ELSE 'Workout ' END ||
+                       COALESCE(s.template_label_snapshot, t.label, '?') AS workout_name,
                    SUM(CASE WHEN we.skipped=0 THEN 1 ELSE 0 END) AS completed_count,
                    COUNT(we.id) AS visited_count
             FROM workout_sessions s
@@ -427,7 +676,11 @@ class WorkoutService:
     def exercise_history(self, exercise_id: int, limit: int = 100):
         rows = self.db.fetchall(
             """
-            SELECT we.*, ws.session_date, ws.bodyweight AS session_bodyweight, t.label AS template_label
+            SELECT we.*, ws.session_date, ws.bodyweight AS session_bodyweight,
+                   COALESCE(ws.template_label_snapshot, t.label) AS template_label,
+                   CASE WHEN t.active=0 THEN 1 ELSE 0 END AS template_removed,
+                   CASE WHEN t.active=0 THEN 'Removed Workout ' ELSE 'Workout ' END ||
+                       COALESCE(ws.template_label_snapshot, t.label, '?') AS workout_name
             FROM workout_entries we
             JOIN workout_sessions ws ON ws.id=we.session_id
             LEFT JOIN workout_templates t ON t.id=ws.template_id

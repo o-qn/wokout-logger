@@ -11,6 +11,15 @@ from ..database import Database
 from ..notation import format_entry
 
 
+def _duration_text(value):
+    if value is None:
+        return "Not recorded"
+    seconds = max(0, int(float(value)))
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 class ExcelExporter:
     def __init__(self, db: Database):
         self.db = db
@@ -39,7 +48,9 @@ class ExcelExporter:
     def _sessions(self):
         return [dict(r) for r in self.db.fetchall(
             """
-            SELECT s.*, t.label AS template_label
+            SELECT s.*, COALESCE(s.template_label_snapshot,t.label) AS template_label,
+                   CASE WHEN t.active=0 THEN 'Removed Workout ' ELSE 'Workout ' END ||
+                   COALESCE(s.template_label_snapshot,t.label,'—') AS workout_name
             FROM workout_sessions s
             LEFT JOIN workout_templates t ON t.id=s.template_id
             WHERE s.status IN ('complete','incomplete')
@@ -53,15 +64,16 @@ class ExcelExporter:
         ws.cell(2, 1, "Bodyweight")
         ws.cell(3, 1, "Status")
         ws.cell(4, 1, "Workout")
-        for row in range(1, 5):
+        ws.cell(5, 1, "Workout duration")
+        for row in range(1, 6):
             ws.cell(row, 1).font = Font(bold=True)
 
         for col, session in enumerate(sessions, start=2):
-            label = session.get("template_label") or "—"
             ws.cell(1, col, session["session_date"])
             ws.cell(2, col, f"{session['bodyweight']} kg")
             ws.cell(3, col, session["status"])
-            ws.cell(4, col, f"Workout {label}")
+            ws.cell(4, col, session["workout_name"])
+            ws.cell(5, col, _duration_text(session.get("workout_duration_seconds")))
             ws.cell(1, col).font = Font(bold=True)
 
         # Stable union of exercise snapshot names, then current display order for never-used exercises.
@@ -79,7 +91,7 @@ class ExcelExporter:
         for r in self.db.fetchall("SELECT name FROM exercises ORDER BY display_order, id"):
             names.setdefault(r["name"], None)
 
-        name_rows = {name: idx for idx, name in enumerate(names.keys(), start=5)}
+        name_rows = {name: idx for idx, name in enumerate(names.keys(), start=6)}
         for name, row_idx in name_rows.items():
             ws.cell(row_idx, 1, name)
 
@@ -105,7 +117,9 @@ class ExcelExporter:
             c.font = Font(bold=True)
         rows = self.db.fetchall(
             """
-            SELECT we.*, s.session_date, s.bodyweight AS session_bodyweight, t.label AS template_label
+            SELECT we.*, s.session_date, s.bodyweight AS session_bodyweight,
+                   CASE WHEN t.active=0 THEN 'Removed Workout ' ELSE 'Workout ' END ||
+                   COALESCE(s.template_label_snapshot,t.label,'—') AS workout_name
             FROM workout_entries we
             JOIN workout_sessions s ON s.id=we.session_id
             LEFT JOIN workout_templates t ON t.id=s.template_id
@@ -117,7 +131,7 @@ class ExcelExporter:
             e = dict(raw)
             ws.append([
                 e["session_date"],
-                f"Workout {e['template_label']}" if e["template_label"] else "",
+                e["workout_name"],
                 e["exercise_name_snapshot"],
                 format_entry(e),
                 e["session_bodyweight"],
@@ -145,14 +159,16 @@ class ExcelExporter:
             "session_id", "date", "workout", "status", "exercise_order", "exercise", "measurement_type",
             "unit", "bodyweight", "external_load", "assistance", "reps", "duration_seconds", "rounds",
             "rest_seconds", "resistance_value", "resistance_unit", "custom_result", "rir", "failure",
-            "notes", "skipped",
+            "notes", "skipped", "workout_duration_seconds",
         ]
         ws.append(headers)
         for c in ws[1]:
             c.font = Font(bold=True)
         rows = self.db.fetchall(
             """
-            SELECT we.*, s.session_date, s.status, t.label AS template_label
+            SELECT we.*, s.session_date, s.status, s.workout_duration_seconds,
+                   CASE WHEN t.active=0 THEN 'Removed Workout ' ELSE 'Workout ' END ||
+                   COALESCE(s.template_label_snapshot,t.label,'—') AS workout_name
             FROM workout_entries we
             JOIN workout_sessions s ON s.id=we.session_id
             LEFT JOIN workout_templates t ON t.id=s.template_id
@@ -162,11 +178,11 @@ class ExcelExporter:
         )
         for r in rows:
             ws.append([
-                r["session_id"], r["session_date"], r["template_label"], r["status"], r["exercise_order"],
+                r["session_id"], r["session_date"], r["workout_name"], r["status"], r["exercise_order"],
                 r["exercise_name_snapshot"], r["measurement_type"], r["unit"], r["bodyweight"],
                 r["external_load"], r["assistance"], r["reps"], r["duration_seconds"], r["rounds"],
                 r["rest_seconds"], r["resistance_value"], r["resistance_unit"], r["custom_result"],
-                r["rir_code"], r["failure"], r["notes"], r["skipped"],
+                r["rir_code"], r["failure"], r["notes"], r["skipped"], r["workout_duration_seconds"],
             ])
 
     def _autosize(self, ws):

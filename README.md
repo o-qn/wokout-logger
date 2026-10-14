@@ -5,13 +5,21 @@ A keyboard-first Linux terminal workout logger for one-set full-body training. I
 ## What it does
 
 - Arrow-key + Enter terminal menus; exercise names do not need to be typed during a workout.
+- Up from the first menu item wraps to the last; Down from the last wraps to the first.
 - Date and decimal bodyweight logging.
 - Reusable Workout A/B/C/... templates.
 - New-workout mode where exercises disappear from the selection list after being logged.
 - Existing-template mode where the saved order is followed automatically.
 - Previous performance and previous note display.
 - Fast reuse of saved load/settings, with an explicit **Update load/settings** option.
-- RIR choices: `F`, `0`, `1`, `2`.
+- RIR choices: `F`, `0`, `1`, `2`, plus **Other RIR value** for any non-negative whole number.
+- Live workout time and rest time above the active menu or input; rest restarts after each logged set.
+- RIR-aware performance checks beside each exercise in the workout summary.
+- Editable template membership and order, applied to the next session.
+- Saved-workout corrections with immutable before/after revision history.
+- Automatic SQLite backups and recovery that preserves newer workouts.
+- Pause/resume for both timers; saved workout durations in history and Excel.
+- Optional target-rest reminders, with a visible indicator and terminal bell.
 - Optional notes; press Enter on an empty notes field to skip.
 - Exercise modes: external weight, bodyweight, BW + load, assistance, isometric, resistance units, AMRAP, and custom.
 - Skip, undo, edit, and **Call it a day**.
@@ -44,10 +52,40 @@ The versioned schema uses these main tables:
 - `workout_sessions`
 - `workout_entries`
 - `bodyweight_entries`
+- `workout_session_exercises`
+- `workout_revisions`
+- `workout_pause_intervals`
+- `app_settings`
 
 Workout entries snapshot the exercise name, measurement type, units, load/settings, bodyweight, reps/time, RIR, notes, order, and skipped state. This means renaming or reconfiguring an exercise later does not rewrite historical data.
 
-Templates also snapshot measurement behavior and their remembered load/settings. When an existing template is repeated, you normally only enter reps, RIR, and optional notes unless you select **Update load/settings**.
+Templates remember load/settings. Each session snapshots the current exercise configuration when it starts, so changes in **Manage exercises** apply to the next session, including repeats of existing templates. Sessions already started and historical entries retain their original names, measurements and units. Changing a measurement type or unit clears incompatible remembered settings and prompts for new values. When an existing template is repeated, you normally only enter reps, RIR, and optional notes unless you select **Update load/settings**.
+
+**Start workout → Remove workout template** hides a template and reletters the remaining active templates A/B/C. It preserves every saved session, exercise result and weigh-in. Sessions belonging to a removed template appear as **Removed Workout A** (or their original session letter), alongside their date, in history and Excel. Historical letters stay fixed even when active templates receive new letters.
+
+Workout time starts at zero when the session is created. Rest time begins after the first logged set and restarts after each subsequent logged set; skips and ordinary corrections do not restart it. Undo restores the most recent surviving set's rest timer or clears it when no sets remain. Use **Pause workout** to stop both timers, then resume or return to the main menu with the pause saved. A pause survives closing the app. Time while the app is closed is counted only when the workout was left running. Completed workout duration excludes pauses and appears in history and Excel. Older workouts without a recorded duration show **Not recorded**.
+
+The summary compares each result with the latest earlier non-skipped result for that exercise. At matching load/settings and RIR, an extra rep is **+1 rep**. When RIR differs, the **technical** change is `(current reps + current RIR) − (previous reps + previous RIR)`: for example, 6 reps at 0 RIR or F followed by 6 at 1 RIR is **+1 technical**; 6 at 2 RIR is **+2 technical**. F counts as zero in this calculation, but transitions between F and 0 RIR are explicitly shown. Missing RIR or changed load, units, measurement mode, or bodyweight for bodyweight-based exercises produces descriptive context instead of an improvement claim.
+
+Use **Change comparison baseline** during a session or when viewing a saved workout to choose **Previous session** or **Last session with matching load/settings**. Comparisons show the source date, result, and RIR, and exclude later workouts. **Preferences → Comparison baseline** sets the default for new sessions.
+
+## Templates and saved corrections
+
+Open **Edit workout templates** from the main menu or Start workout. Select an exercise to move it up/down or remove it, or choose **Add exercise**. **Save template** applies the draft to future sessions; **Cancel changes** leaves the template unchanged. Workouts already started retain their original exercise order and configuration.
+
+Open a workout in **Workout history** to correct an entry, workout date, or bodyweight. Each correction is reviewed before saving and keeps immutable before/after values, a timestamp, and an optional reason under **View revision history**. Bodyweight corrections update the session, weigh-in, and entry bodyweight values together. Historical exercise names, units, and measurement modes remain fixed. Corrections refresh Excel and do not change template defaults or workout timing.
+
+## Backups and recovery
+
+Backups are stored in a `backups/` folder beside the database. The app makes one daily snapshot on startup, a snapshot after every saved workout, and a snapshot before template edits, exercise-setting changes, saved corrections, or recovery. SQLite's backup API captures committed data consistently, including WAL data. Snapshots are validated and are not automatically pruned.
+
+Use **Backups and recovery** to create or inspect snapshots, or recover missing history. Recovery adds missing sessions, results, weigh-ins, and audit records while preserving existing workouts, corrections, and preferences. Running recovery again does not duplicate the imported records. It also makes a backup before recovery.
+
+If the database cannot be opened, startup offers a validated backup as a separate recovery copy. The original database and its journal files remain available. Subsequent launches use the recovery copy selected in `active-recovery.json` beside the database.
+
+## Rest reminders
+
+Reminders start **off**. In **Preferences → Rest reminder target and sound**, choose a target in seconds and optionally enable the terminal bell for new sessions. **Rest reminder settings** during a workout changes only that workout. The display shows **Rest complete** at the target; the counter continues upward. A sound-enabled reminder rings once for each logged set, including across closing and reopening the app. Audible playback depends on terminal bell settings.
 
 ## First run
 
@@ -117,7 +155,7 @@ Choose the final `Workout <next letter> — create new workout order` option. Th
 
 ## Recovery and autosave
 
-A session row and bodyweight entry are written as soon as the workout begins. Every completed exercise entry, edit, skip, and undo is committed immediately. If the terminal is interrupted, the main menu exposes **Resume unfinished workout** with options to resume, save as incomplete, or discard.
+A session row and bodyweight entry are written as soon as the workout begins. Every completed exercise entry, edit, skip, and undo is committed immediately. If the terminal is interrupted, the main menu exposes **Resume unfinished workout** with options to resume, save as incomplete, or discard. Discarding hides an unfinished workout from recovery while retaining its stored rows. Undo is available only during an active workout.
 
 `Ctrl+C` exits safely; already completed entries remain stored. A value that was only half-typed at the exact moment of interruption is not considered a completed entry.
 

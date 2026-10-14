@@ -23,11 +23,11 @@ class NotationTests(unittest.TestCase):
     def test_rep_comparison(self):
         previous = {
             "measurement_type": "external_weight", "external_load": "19.5", "unit": "kg",
-            "reps": 4, "skipped": 0,
+            "reps": 4, "rir_code": "0", "skipped": 0,
         }
         current = {
             "measurement_type": "external_weight", "external_load": "19.5", "unit": "kg",
-            "reps": 5, "skipped": 0,
+            "reps": 5, "rir_code": "0", "skipped": 0,
         }
         self.assertEqual(comparison_message(current, previous), "+1 rep vs previous session")
 

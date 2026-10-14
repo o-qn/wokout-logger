@@ -12,6 +12,34 @@ from workout_logger.services.workout_service import WorkoutService
 
 
 class ExportTests(unittest.TestCase):
+    def test_removed_templates_keep_all_sessions_and_original_names_in_excel(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            db = Database(td / "workouts.db")
+            service = WorkoutService(db)
+            exercise_id = service.add_exercise("Curl", "external_weight")
+            sessions = []
+            for day in (1, 2):
+                sid = service.start_new_template_session(f"2026-10-{day:02d}", "80")
+                service.save_entry(sid, WorkoutEntryData(
+                    exercise_id=exercise_id, exercise_name="Curl", measurement_type="external_weight",
+                    external_load=Decimal("10"), reps=6, rir_code="0",
+                ))
+                service.finalize_session(sid)
+                sessions.append(sid)
+            service.remove_template(service.get_session(sessions[0])["template_id"])
+            self.assertEqual([t["label"] for t in service.templates()], ["A"])
+            output = ExcelExporter(db).export(td / "history.xlsx")
+            wb = load_workbook(output)
+            self.assertEqual(wb["Workouts"].cell(4, 2).value, "Removed Workout A")
+            self.assertEqual(wb["Workouts"].cell(4, 3).value, "Workout B")
+            self.assertEqual(wb["Exercise History"].cell(2, 2).value, "Removed Workout A")
+            self.assertEqual(wb["Raw Data"].cell(2, 3).value, "Removed Workout A")
+            self.assertEqual(wb["Exercise History"].max_row, 3)
+            self.assertEqual(wb["Bodyweight"].max_row, 3)
+            self.assertEqual(wb["Raw Data"].max_row, 3)
+            wb.close()
+
     def test_end_to_end_database_and_excel(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)

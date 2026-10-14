@@ -6,16 +6,18 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Optional
 
 from prompt_toolkit import Application
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit
 from prompt_toolkit.shortcuts import prompt
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import Label, RadioList
+from prompt_toolkit.widgets import Label, RadioList, TextArea
 from rich.console import Console
 from rich.panel import Panel
 
 from ..models import MEASUREMENT_TYPES, WorkoutEntryData
 from ..notation import parse_decimal, decimal_text, format_entry
+from .timers import timer_text
 
 console = Console()
 
@@ -31,6 +33,7 @@ PT_STYLE = Style.from_dict({
     "radio-selected": "fg:#5f87ff bold",
     "radio-checked": "fg:#5fd787",
     "instruction": "fg:#888888",
+    "timer": "fg:#5fd787 bold",
 })
 
 
@@ -58,7 +61,7 @@ def select(message: str, choices, default=None):
 
     @kb.add("enter")
     def _accept(event):
-        event.app.exit(result=radio.current_value)
+        event.app.exit(result=values[radio._selected_index][0])
 
     @kb.add("escape")
     def _cancel(event):
@@ -68,18 +71,31 @@ def select(message: str, choices, default=None):
     def _interrupt(event):
         event.app.exit(exception=KeyboardInterrupt())
 
+    def _move(offset):
+        def move(event):
+            radio._selected_index = (radio._selected_index + offset) % len(values)
+            radio.current_value = values[radio._selected_index][0]
+        return move
+
     # RadioList has its own Enter binding which only marks an item as checked.
     # Install our accept/cancel bindings directly on the focused control as well
     # so they take priority and Enter actually closes the menu with a result.
     radio.control.key_bindings.add("enter", eager=True)(_accept)
     radio.control.key_bindings.add("escape", eager=True)(_cancel)
     radio.control.key_bindings.add("c-c", eager=True)(_interrupt)
+    for key in ("up", "k"):
+        radio.control.key_bindings.add(key, eager=True)(_move(-1))
+    for key in ("down", "j"):
+        radio.control.key_bindings.add(key, eager=True)(_move(1))
 
-    root = HSplit([
+    controls = [
         Label(text=message, style="class:question"),
         radio,
         Label(text="↑/↓ move • Enter select • Esc back", style="class:instruction"),
-    ])
+    ]
+    if timer_text():
+        controls.insert(0, Label(text=timer_text, style="class:timer"))
+    root = HSplit(controls)
     app = Application(
         layout=Layout(root, focused_element=radio),
         key_bindings=kb,
@@ -87,12 +103,42 @@ def select(message: str, choices, default=None):
         full_screen=False,
         mouse_support=False,
         erase_when_done=True,
+        refresh_interval=1 if timer_text() else None,
     )
     return app.run()
 
 
 def text(message: str, default: str = "") -> Optional[str]:
-    return prompt(f"{message} ", default=default)
+    if not timer_text():
+        return prompt(f"{message} ", default=default)
+
+    def accept(buffer):
+        get_app().exit(result=buffer.text)
+        return True
+
+    # The timer occupies its own label. Redrawing it leaves the editable buffer,
+    # cursor and completion state intact while a load/reps/note is being typed.
+    field = TextArea(text=default, prompt=f"{message} ", multiline=False, height=1, accept_handler=accept)
+    field.buffer.cursor_position = len(default)
+    kb = KeyBindings()
+
+    @kb.add("escape")
+    def cancel(event):
+        event.app.exit(result=None)
+
+    @kb.add("c-c")
+    def interrupt(event):
+        event.app.exit(exception=KeyboardInterrupt())
+
+    @kb.add("c-d")
+    def eof(event):
+        event.app.exit(exception=EOFError())
+
+    return Application(
+        layout=Layout(HSplit([Label(text=timer_text, style="class:timer"), field]), focused_element=field),
+        key_bindings=kb, style=PT_STYLE, full_screen=False,
+        mouse_support=False, erase_when_done=True, refresh_interval=1,
+    ).run()
 
 
 def confirm(message: str, default: bool = True) -> Optional[bool]:
@@ -126,8 +172,8 @@ def ask_decimal(message: str, default: Optional[Any] = None, allow_blank: bool =
             return None
         try:
             value = parse_decimal(raw)
-            if value < 0:
-                raise InvalidOperation("negative")
+            if not value.is_finite() or value < 0:
+                raise InvalidOperation("non-finite or negative")
             return value
         except (InvalidOperation, ValueError):
             console.print("[red]Enter a valid non-negative number, e.g. 19.5.[/red]")
@@ -155,7 +201,14 @@ def ask_rir(default: Optional[str] = None) -> Optional[str]:
         Choice("1 — 1 RIR", "1"),
         Choice("2 — 2 RIR", "2"),
     ]
-    return select("RIR:", options, default=(default.upper() if default else None))
+    if default and str(default).isdigit() and int(default) > 2:
+        options.append(Choice(f"{int(default)} — {int(default)} RIR", str(int(default))))
+    options.append(Choice("Other RIR value", "other"))
+    result = select("RIR:", options, default=(default.upper() if default else None))
+    if result == "other":
+        value = ask_int("Reps in reserve:", minimum=0)
+        return str(value) if value is not None else None
+    return result
 
 
 def show_previous(previous: Optional[Mapping[str, Any]], bodyweight: str):
@@ -163,7 +216,9 @@ def show_previous(previous: Optional[Mapping[str, Any]], bodyweight: str):
         performance = format_entry(previous)
         note = previous.get("notes") or "—"
         previous_bw = previous.get("bodyweight") or "—"
+        previous_date = previous.get("session_date") or "unknown date"
         content = (
+            f"[bold]Previous date:[/bold] {previous_date}\n"
             f"[bold]Previous:[/bold] {performance}\n"
             f"[bold]Previous BW:[/bold] {previous_bw} kg\n"
             f"[bold]Previous note:[/bold] {note}\n"
@@ -208,17 +263,23 @@ def prompt_entry(
 
     if mode == "external_weight":
         prev = _value(base, "external_load", "default_external_load")
-        data.external_load = ask_decimal("Load (kg):", prev) if update_settings or prev is None else Decimal(str(prev))
+        data.external_load = ask_decimal(f"Load ({unit}):", prev) if update_settings or prev is None else Decimal(str(prev))
+        if data.external_load is None:
+            return None
         data.reps = ask_int("Reps:", _value(existing, "reps"), 0)
     elif mode == "bodyweight":
         data.reps = ask_int("Reps:", _value(existing, "reps"), 0)
     elif mode == "bodyweight_plus":
         prev = _value(base, "external_load", "default_external_load")
-        data.external_load = ask_decimal("Added load (kg):", prev) if update_settings or prev is None else Decimal(str(prev))
+        data.external_load = ask_decimal(f"Added load ({unit}):", prev) if update_settings or prev is None else Decimal(str(prev))
+        if data.external_load is None:
+            return None
         data.reps = ask_int("Reps:", _value(existing, "reps"), 0)
     elif mode == "assistance":
         prev = _value(base, "assistance", "default_assistance")
-        data.assistance = ask_decimal("Assistance (kg):", prev) if update_settings or prev is None else Decimal(str(prev))
+        data.assistance = ask_decimal(f"Assistance ({unit}):", prev) if update_settings or prev is None else Decimal(str(prev))
+        if data.assistance is None:
+            return None
         data.reps = ask_int("Reps:", _value(existing, "reps"), 0)
     elif mode == "isometric":
         dur = _value(base, "duration_seconds", "default_duration_seconds")
@@ -226,8 +287,14 @@ def prompt_entry(
         rest = _value(base, "rest_seconds", "default_rest_seconds")
         if update_settings or dur is None:
             data.duration_seconds = ask_decimal("Hold duration (seconds):", dur)
+            if data.duration_seconds is None:
+                return None
             data.rounds = ask_int("Rounds:", rounds, 1)
+            if data.rounds is None:
+                return None
             data.rest_seconds = ask_decimal("Rest between rounds (seconds):", rest if rest is not None else 0)
+            if data.rest_seconds is None:
+                return None
         else:
             data.duration_seconds = Decimal(str(dur))
             data.rounds = int(rounds) if rounds is not None else 1
@@ -236,14 +303,23 @@ def prompt_entry(
         rv = _value(base, "resistance_value", "default_resistance_value")
         if not r_unit:
             r_unit = text("Resistance unit (e.g. springs):", "springs")
+            if r_unit is None:
+                return None
             data.resistance_unit = (r_unit or "units").strip() or "units"
         data.resistance_value = ask_decimal(f"Resistance ({data.resistance_unit}):", rv) if update_settings or rv is None else Decimal(str(rv))
+        if data.resistance_value is None:
+            return None
         data.reps = ask_int("Reps:", _value(existing, "reps"), 0)
     elif mode == "amrap":
         data.reps = ask_int("AMRAP result (reps):", _value(existing, "reps"), 0)
     else:
         result = text("Result:", str(_value(existing, "custom_result") or ""))
-        data.custom_result = (result or "").strip()
+        if result is None:
+            return None
+        data.custom_result = result.strip()
+
+    if mode in {"external_weight", "bodyweight", "bodyweight_plus", "assistance", "resistance_units", "amrap"} and data.reps is None:
+        return None
 
     rir = ask_rir(_value(existing, "rir_code"))
     if rir is None:
@@ -251,7 +327,9 @@ def prompt_entry(
     data.rir_code = rir
     data.failure = rir == "F"
     note = text("Notes (Enter to skip):", str(_value(existing, "notes") or ""))
-    data.notes = (note or "").strip()
+    if note is None:
+        return None
+    data.notes = note.strip()
     return data
 
 
